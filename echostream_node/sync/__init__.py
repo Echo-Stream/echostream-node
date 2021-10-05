@@ -284,7 +284,7 @@ class Node:
                 appsync_endpoint or environ["APPSYNC_ENDPOINT"],
             ),
         )
-        self._create_message_dumps = create_message_dumps
+        self.__create_message_dumps = create_message_dumps
         self.__name = name or environ["NODE"]
         self.__tenant = tenant or environ["TENANT"]
         data = self.__client.execute(
@@ -416,7 +416,7 @@ class Node:
 
     @singledispatchmethod
     def create_message(self, body: object, *, targets: set[str] = None) -> Message:
-        return self.create_message(self._create_message_dumps(body))
+        return self.create_message(self.__create_message_dumps(body))
 
     @create_message.register
     def _(self, body: str, *, targets: set[str] = None) -> None:
