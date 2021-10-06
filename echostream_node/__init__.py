@@ -1,8 +1,10 @@
+from __future__ import annotations
+
+import logging
 from datetime import datetime
 from typing import TYPE_CHECKING, Dict, NamedTuple, TypedDict, Union
 
 from gql import gql
-import logging
 
 
 def getLogger() -> logging.Logger:
@@ -15,8 +17,6 @@ if TYPE_CHECKING:
     from mypy_boto3_sqs.type_defs import MessageAttributeValueTypeDef
 else:
     MessageAttributeValueTypeDef = dict
-
-LambdaEvent = LambdaReturn = Union[bool, dict, float, int, list, str, tuple, None]
 
 _CREATE_AUDIT_RECORDS = gql(
     """
@@ -188,20 +188,6 @@ _GET_EDGES = gql(
 )
 
 
-class Message(TypedDict, total=False):
-    MessageAttributes: Dict[str, MessageAttributeValueTypeDef]
-    MessageBody: str
-    MessageDeduplicationId: str
-    MessageGroupId: str
-    ReceiptHandle: str
-
-
-class PresignedPost(TypedDict):
-    expiration: datetime
-    fields: Dict[str, str]
-    url: str
-
-
 class AuditRecord(TypedDict):
     attributes: dict[str, Union[bool, int, float, str]]
     datetime: datetime
@@ -233,3 +219,22 @@ class BulkDataStorage:
     @property
     def presignedPost(self) -> PresignedPost:
         return self.__presigned_post
+
+LambdaEvent = Union[bool, dict, float, int, list, str, tuple, None]
+
+class Message(TypedDict, total=False):
+    MessageAttributes: Dict[str, MessageAttributeValueTypeDef]
+    MessageBody: str
+    MessageDeduplicationId: str
+    MessageGroupId: str
+    ReceiptHandle: str
+
+
+class PresignedPost(TypedDict):
+    expiration: datetime
+    fields: Dict[str, str]
+    url: str
+
+class Source(NamedTuple):
+    name: str
+    queue: str
