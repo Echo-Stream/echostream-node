@@ -220,7 +220,9 @@ class BulkDataStorage:
     def presignedPost(self) -> PresignedPost:
         return self.__presigned_post
 
+
 LambdaEvent = Union[bool, dict, float, int, list, str, tuple, None]
+
 
 class Message(TypedDict, total=False):
     MessageAttributes: Dict[str, MessageAttributeValueTypeDef]
@@ -234,6 +236,7 @@ class PresignedPost(TypedDict):
     expiration: datetime
     fields: Dict[str, str]
     url: str
+
 
 class Source(NamedTuple):
     name: str
