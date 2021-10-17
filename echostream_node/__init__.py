@@ -297,14 +297,7 @@ class BaseNode(ABC):
                 retries={"mode": "standard"},
             ),
         )
-        with ThreadPoolExecutor() as executor:
-            wait(
-                [
-                    executor.submit(self.__initialize_config),
-                    executor.submit(self._initialize_edges),
-                    executor.submit(self.__initialize_message_types),
-                ]
-            )
+        self._initialize()
 
     def __initialize_config(self) -> None:
         data: dict[str, dict] = self.gql_client.execute(
@@ -335,6 +328,16 @@ class BaseNode(ABC):
             self.__send_message_type = send_message_type["name"]
             self.__send_message_auditor: Auditor = dynamic_function_loader.load(
                 send_message_type["auditor"]
+            )
+
+    def _initialize(self):
+        with ThreadPoolExecutor() as executor:
+            wait(
+                [
+                    executor.submit(self.__initialize_config),
+                    executor.submit(self._initialize_edges),
+                    executor.submit(self.__initialize_message_types),
+                ]
             )
 
     @abstractmethod
