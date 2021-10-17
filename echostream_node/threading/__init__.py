@@ -274,7 +274,50 @@ class Node(BaseNode):
                     )
 
 
-class __AppNodeReceiver(Thread):
+class __DeleteMessageQueue(Queue):
+    def __init__(self, node: Node, queue: str, source: str) -> None:
+        super().__init__()
+
+        def deleter() -> None:
+            while True:
+                receipt_handles: list[str] = list()
+                while len(receipt_handles) < 10:
+                    try:
+                        receipt_handles.append(self.__get())
+                    except Empty:
+                        break
+                if not receipt_handles:
+                    continue
+                try:
+                    response = node.sqs_client.delete_message_batch(
+                        QueueUrl=queue,
+                        Entries=[
+                            DeleteMessageBatchRequestEntryTypeDef(
+                                Id=str(id), ReceiptHandle=receipt_handle
+                            )
+                            for id, receipt_handle in enumerate(receipt_handles)
+                        ],
+                    )
+                    for failed in response["Failed"]:
+                        id = failed.pop("Id")
+                        getLogger().error(
+                            f"Unable to delete message {receipt_handles[id]} from {source}, reason {failed}"
+                        )
+                except Exception:
+                    getLogger().exception(f"Error deleting messages from {source}")
+                finally:
+                    for _ in range(len(receipt_handles)):
+                        self.task_done()
+
+        Thread(
+            daemon=True, name=f"SourceMessageDeleter({source})", target=deleter
+        ).start()
+
+    def __get(self) -> str:
+        return self.get(block=True, timeout=0.1)
+
+
+class __SourceMessageReceiver(Thread):
     def __init__(self, node: Node, queue: str, source: str) -> None:
         super().__init__(daemon=True, name=f"AppNodeReceiver({source})")
         self.__continue = Event()
@@ -358,49 +401,6 @@ class __AppNodeReceiver(Thread):
         self.__continue.clear()
 
 
-class __DeleteMessageQueue(Queue):
-    def __init__(self, node: Node, queue: str, source: str) -> None:
-        super().__init__()
-
-        def deleter() -> None:
-            while True:
-                receipt_handles: list[str] = list()
-                while len(receipt_handles) < 10:
-                    try:
-                        receipt_handles.append(self.__get())
-                    except Empty:
-                        break
-                if not receipt_handles:
-                    continue
-                try:
-                    response = node.sqs_client.delete_message_batch(
-                        QueueUrl=queue,
-                        Entries=[
-                            DeleteMessageBatchRequestEntryTypeDef(
-                                Id=str(id), ReceiptHandle=receipt_handle
-                            )
-                            for id, receipt_handle in enumerate(receipt_handles)
-                        ],
-                    )
-                    for failed in response["Failed"]:
-                        id = failed.pop("Id")
-                        getLogger().error(
-                            f"Unable to delete message {receipt_handles[id]} from {source}, reason {failed}"
-                        )
-                except Exception:
-                    getLogger().exception(f"Error deleting messages from {source}")
-                finally:
-                    for _ in range(len(receipt_handles)):
-                        self.task_done()
-
-        Thread(
-            daemon=True, name=f"SourceMessageDeleter({source})", target=deleter
-        ).start()
-
-    def __get(self) -> str:
-        return self.get(block=True, timeout=0.1)
-
-
 class AppNode(Node):
     def __init__(
         self,
@@ -422,28 +422,28 @@ class AppNode(Node):
             user_pool_id=user_pool_id,
             username=username,
         )
-        self.__app_node_receivers: list[__AppNodeReceiver] = list()
+        self.__source_message_receivers: list[__SourceMessageReceiver] = list()
 
     def _initialize_edges(self) -> None:
         super()._initialize_edges()
         with self._lock:
-            for app_node_receiver in self.__app_node_receivers:
+            for app_node_receiver in self.__source_message_receivers:
                 app_node_receiver.stop()
-            for app_node_receiver in self.__app_node_receivers:
+            for app_node_receiver in self.__source_message_receivers:
                 app_node_receiver.join()
-            self.__app_node_receivers = [
-                __AppNodeReceiver(self, edge.queue, edge.name) for edge in self.sources
+            self.__source_message_receivers = [
+                __SourceMessageReceiver(self, edge.queue, edge.name) for edge in self.sources
             ]
 
     def join(self) -> None:
         with self._lock:
-            for app_node_receiver in self.__app_node_receivers:
+            for app_node_receiver in self.__source_message_receivers:
                 app_node_receiver.join()
         super().join()
 
     def stop(self):
         with self._lock:
-            for app_node_receiver in self.__app_node_receivers:
+            for app_node_receiver in self.__source_message_receivers:
                 app_node_receiver.stop()
 
 
