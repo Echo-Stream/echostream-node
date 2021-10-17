@@ -4,7 +4,7 @@ import json
 from gzip import GzipFile
 from io import BytesIO
 from queue import Empty, Queue, SimpleQueue
-from threading import Condition, Event, Thread
+from threading import Condition, Event, RLock, Thread
 from time import sleep
 from typing import TYPE_CHECKING, Any, BinaryIO, Iterator, Union
 from uuid import uuid4
@@ -228,12 +228,18 @@ class Node(BaseNode):
         self._send_audit_records_queue = __AuditRecordQueue(
             self.send_message_type, self
         )
+        self._lock = RLock()
+        self.__target_message_queues: dict[str, __TargetMessageQueue] = dict()
 
     def _initialize_edges(self) -> None:
         super()._initialize_edges()
-        self.__target_message_queues = {
-            edge.name: __TargetMessageQueue(self, edge.queue) for edge in self.targets
-        }
+        with self._lock:
+            for target_message_queue in self.__target_message_queues.values():
+                target_message_queue.join()
+            self.__target_message_queues = {
+                edge.name: __TargetMessageQueue(self, edge.queue)
+                for edge in self.targets
+            }
 
     def handle_bulk_data(self, data: Union[bytearray, bytes]) -> str:
         return self._bulk_data_storage_queue.get().handle_bulk_data(data)
@@ -247,8 +253,9 @@ class Node(BaseNode):
     def join(self) -> None:
         self._receive_audit_records_queue.join()
         self._send_audit_records_queue.join()
-        for target_message_queue in self.__target_message_queues:
-            target_message_queue.join()
+        with self._lock:
+            for target_message_queue in self.__target_message_queues.values():
+                target_message_queue.join()
 
     def send_message(self, /, message: Message, *, targets: set[str] = None) -> None:
         self.send_messages([message], targets=targets)
@@ -258,8 +265,10 @@ class Node(BaseNode):
     ) -> None:
         if messages:
             for target in targets or self.targets:
+                with self._lock:
+                    target_message_queue = self.__target_message_queues[target]
                 for message in messages:
-                    self.__target_message_queues[target].put_nowait(message)
+                    target_message_queue.put_nowait(message)
                     self._send_audit_records_queue.put_nowait(
                         AuditRecord(self.send_message_auditor, message)
                     )
@@ -414,46 +423,39 @@ class AppNode(Node):
             username=username,
         )
         self.__app_node_receivers: list[__AppNodeReceiver] = list()
-        for edge in self.sources:
-            self.__app_node_receivers.append(__AppNodeReceiver(self, edge.queue, edge.name))
+
+    def _initialize_edges(self) -> None:
+        super()._initialize_edges()
+        with self._lock:
+            for app_node_receiver in self.__app_node_receivers:
+                app_node_receiver.stop()
+            for app_node_receiver in self.__app_node_receivers:
+                app_node_receiver.join()
+            self.__app_node_receivers = [
+                __AppNodeReceiver(self, edge.queue, edge.name) for edge in self.sources
+            ]
 
     def join(self) -> None:
-        for app_node_receiver in self.__app_node_receivers:
-            app_node_receiver.join()
+        with self._lock:
+            for app_node_receiver in self.__app_node_receivers:
+                app_node_receiver.join()
         super().join()
 
     def stop(self):
-        for app_node_receiver in self.__app_node_receivers:
-            app_node_receiver.stop()
+        with self._lock:
+            for app_node_receiver in self.__app_node_receivers:
+                app_node_receiver.stop()
 
 
 class LambdaNode(Node):
-    def __init__(
-        self,
-        *,
-        appsync_endpoint: str = None,
-        client_id: str = None,
-        name: str = None,
-        password: str = None,
-        tenant: str = None,
-        user_pool_id: str = None,
-        username: str = None,
-    ) -> None:
-        super().__init__(
-            appsync_endpoint=appsync_endpoint,
-            client_id=client_id,
-            name=name,
-            password=password,
-            tenant=tenant,
-            user_pool_id=user_pool_id,
-            username=username,
-        )
+    def _get_source(self, queue_arn: str) -> str:
+        return self.__queue_name_to_source[queue_arn.split(":")[-1:][0]]
+
+    def _initialize_edges(self) -> None:
+        super()._initialize_edges()
         self.__queue_name_to_source = {
             edge.queue.split("/")[-1:][0]: edge.name for edge in self.sources
         }
-
-    def _get_source(self, queue_arn: str) -> str:
-        return self.__queue_name_to_source[queue_arn.split(":")[-1:][0]]
 
     def handle_event(self, event: LambdaEvent) -> None:
         records: list[
