@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 from gzip import GzipFile
 from io import BytesIO
-from queue import Empty, Queue, SimpleQueue
-from threading import Condition, Event, RLock, Thread
+from queue import Empty, Queue
+from threading import Condition, Event, Thread
 from time import sleep
-from typing import TYPE_CHECKING, Any, BinaryIO, Iterator, Union
+from typing import TYPE_CHECKING, Any, BinaryIO, Generator, Union
 from uuid import uuid4
 
+import dynamic_function_loader
 from botocore.exceptions import ClientError
 from gql.transport.requests import RequestsHTTPTransport
 from pycognito import Cognito
@@ -17,14 +18,16 @@ from requests import post
 from .. import (
     _CREATE_AUDIT_RECORDS,
     _GET_BULK_DATA_STORAGE_GQL,
+    _GET_NODE_GQL,
+    Auditor,
     AuditRecord,
-    BaseNode,
     BulkDataStorage,
+    Edge,
     LambdaEvent,
     Message,
-    PresignedPost,
-    getLogger,
 )
+from .. import Node as BaseNode
+from .. import getLogger
 
 if TYPE_CHECKING:
     from mypy_boto3_sqs.type_defs import (
@@ -37,18 +40,20 @@ else:
 
 
 class __AuditRecordQueue(Queue):
-    def __init__(self, message_type: str, node: Node) -> None:
+    def __init__(self, message_type: str, name_prefix: str, node: Node) -> None:
         super().__init__()
+        self.__continue = Event()
+        self.__continue.set()
 
         def sender() -> None:
-            while True:
-                audit_records: list[AuditRecord] = list()
-                while len(audit_records) < 500:
+            while self.__continue.is_set() or not self.empty():
+                batch: list[AuditRecord] = list()
+                while len(batch) < 500:
                     try:
-                        audit_records.append(self.__get())
+                        batch.append(self.get(timeout=0.1))
                     except Empty:
                         break
-                if not audit_records:
+                if not batch:
                     continue
                 try:
                     node.gql_client.execute(
@@ -70,26 +75,28 @@ class __AuditRecordQueue(Queue):
                                     sourceNode=audit_record.source_node,
                                     trackingId=audit_record.tracking_id,
                                 )
-                                for audit_record in audit_records
+                                for audit_record in batch
                             ],
                         ),
                     )
                 except Exception:
                     getLogger().exception("Error creating audit records")
                 finally:
-                    for _ in range(len(audit_records)):
+                    for _ in range(len(batch)):
                         self.task_done()
 
-        Thread(daemon=True, name="AuditRecordsSender", target=sender).start()
+        Thread(
+            daemon=True, name=f"{name_prefix}AuditRecordsSender", target=sender
+        ).start()
 
-    def __get(self) -> AuditRecord:
-        return self.get(block=True, timeout=0.1)
+    def get(self, block: bool = True, timeout: float = None) -> AuditRecord:
+        return self.get(block=block, timeout=timeout)
+
+    def stop(self) -> None:
+        self.__continue.clear()
 
 
 class __BulkDataStorage(BulkDataStorage):
-    def __init__(self, bulk_data_storage: dict[str, Union[str, PresignedPost]]) -> None:
-        super().__init__(bulk_data_storage)
-
     def handle_bulk_data(self, data: Union[bytearray, bytes, BinaryIO]) -> str:
         if isinstance(data, BinaryIO):
             data = data.read()
@@ -105,7 +112,7 @@ class __BulkDataStorage(BulkDataStorage):
         return self.presigned_get
 
 
-class __BulkDataStorageQueue(SimpleQueue):
+class __BulkDataStorageQueue(Queue):
     def __init__(self, node: Node) -> None:
         super().__init__()
         self.fill = Condition()
@@ -124,12 +131,16 @@ class __BulkDataStorageQueue(SimpleQueue):
 
         Thread(daemon=True, name="BulkDataStorageQueueFiller", target=filler).start()
 
-    def get(self) -> __BulkDataStorage:
+    def get(self, block: bool = True, timeout: float = None) -> __BulkDataStorage:
         with self.fill:
             if self.qsize() < 20:
                 self.fill.notify()
-        bulk_data_storage: __BulkDataStorage = super().get()
-        return self.get() if bulk_data_storage.expired else bulk_data_storage
+        bulk_data_storage: __BulkDataStorage = super().get(block=block, timeout=timeout)
+        return (
+            self.get(block=block, timeout=timeout)
+            if bulk_data_storage.expired
+            else bulk_data_storage
+        )
 
 
 class __DynamicAuthRequestsHTTPTransport(RequestsHTTPTransport):
@@ -145,17 +156,23 @@ class __DynamicAuthRequestsHTTPTransport(RequestsHTTPTransport):
 
 
 class __TargetMessageQueue(Queue):
-    def __init__(self, node: Node, queue: str, target: str) -> None:
+    def __init__(self, node: Node, edge: Edge) -> None:
         super().__init__()
+        self.__continue = Event()
+        self.__continue.set()
 
-        def batcher() -> Iterator[list[SendMessageBatchRequestEntryTypeDef]]:
+        def batcher() -> Generator[
+            list[SendMessageBatchRequestEntryTypeDef],
+            None,
+            list[SendMessageBatchRequestEntryTypeDef],
+        ]:
             batch: list[SendMessageBatchRequestEntryTypeDef] = list()
             batch_length = 0
             id = 0
-            while True:
+            while self.__continue.is_set() or not self.empty():
                 try:
-                    message = self.__get()
-                    if batch_length + message.length > 262144 or len(batch) == 10:
+                    message = self.get(timeout=0.1)
+                    if batch_length + message.length > 262144:
                         yield batch
                         batch = list()
                         batch_length = 0
@@ -165,6 +182,11 @@ class __TargetMessageQueue(Queue):
                             Id=str(id), **message.sqs_message
                         )
                     )
+                    if len(batch) == 10:
+                        yield batch
+                        batch = list()
+                        batch_length = 0
+                        id = 0
                     id += 1
                     batch_length += message.length
                 except Empty:
@@ -173,30 +195,35 @@ class __TargetMessageQueue(Queue):
                     batch = list()
                     batch_length = 0
                     id = 0
+            if batch:
+                return batch
 
         def sender() -> None:
             for entries in batcher():
                 try:
                     response = node.sqs_client.send_message_batch(
-                        Entries=entries, QueueUrl=queue
+                        Entries=entries, QueueUrl=edge.queue
                     )
                     for failed in response["Failed"]:
                         id = failed.pop("Id")
                         getLogger().error(
-                            f"Unable to send message {entries[id]} to {target}, reason {failed}"
+                            f"Unable to send message {entries[id]} to {edge.name}, reason {failed}"
                         )
                 except Exception:
-                    getLogger().exception(f"Error sending messages to {target}")
+                    getLogger().exception(f"Error sending messages to {edge.name}")
                 finally:
                     for _ in range(len(entries)):
                         self.task_done()
 
         Thread(
-            daemon=True, name=f"TargetMessageSender({target})", target=sender
+            daemon=True, name=f"TargetMessageSender({edge.name})", target=sender
         ).start()
 
-    def __get(self) -> Message:
-        return self.get(block=True, timeout=0.1)
+    def get(self, block: bool = True, timeout: float = None) -> Message:
+        return super().get(block=block, timeout=timeout)
+
+    def stop(self) -> None:
+        self.__continue.clear()
 
 
 class Node(BaseNode):
@@ -221,41 +248,27 @@ class Node(BaseNode):
             user_pool_id=user_pool_id,
             username=username,
         )
-        self._bulk_data_storage_queue = __BulkDataStorageQueue(self)
-        self._receive_audit_records_queue = __AuditRecordQueue(
-            self.receive_message_type, self
-        )
-        self._send_audit_records_queue = __AuditRecordQueue(
-            self.send_message_type, self
-        )
-        self._lock = RLock()
+        self.__bulk_data_storage_queue = __BulkDataStorageQueue(self)
+        self.__receive_audit_records_queue: __AuditRecordQueue = None
+        self.__send_audit_records_queue: __AuditRecordQueue = None
         self.__target_message_queues: dict[str, __TargetMessageQueue] = dict()
 
-    def _initialize_edges(self) -> None:
-        super()._initialize_edges()
-        with self._lock:
-            for target_message_queue in self.__target_message_queues.values():
-                target_message_queue.join()
-            self.__target_message_queues = {
-                edge.name: __TargetMessageQueue(self, edge.queue)
-                for edge in self.targets
-            }
-
     def handle_bulk_data(self, data: Union[bytearray, bytes]) -> str:
-        return self._bulk_data_storage_queue.get().handle_bulk_data(data)
+        return self.__bulk_data_storage_queue.get().handle_bulk_data(data)
 
     def handle_received_messages(self, *, messages: list[Message], source: str) -> None:
         for message in messages:
-            self._receive_audit_records_queue.put_nowait(
+            self.__receive_audit_records_queue.put_nowait(
                 AuditRecord(self.receive_message_auditor, message, source)
             )
 
     def join(self) -> None:
-        self._receive_audit_records_queue.join()
-        self._send_audit_records_queue.join()
-        with self._lock:
-            for target_message_queue in self.__target_message_queues.values():
-                target_message_queue.join()
+        for target_message_queue in self.__target_message_queues.values():
+            target_message_queue.join()
+        if self.__receive_audit_records_queue:
+            self.__receive_audit_records_queue.join()
+        if self.__send_audit_records_queue:
+            self.__send_audit_records_queue.join()
 
     def send_message(self, /, message: Message, *, targets: set[str] = None) -> None:
         self.send_messages([message], targets=targets)
@@ -265,75 +278,125 @@ class Node(BaseNode):
     ) -> None:
         if messages:
             for target in targets or self.targets:
-                with self._lock:
-                    target_message_queue = self.__target_message_queues[target]
+                target_message_queue = self.__target_message_queues[target]
                 for message in messages:
                     target_message_queue.put_nowait(message)
-                    self._send_audit_records_queue.put_nowait(
+                    self.__send_audit_records_queue.put_nowait(
                         AuditRecord(self.send_message_auditor, message)
                     )
 
+    def start(self) -> None:
+        data: dict[str, dict] = self.gql_client.execute(
+            _GET_NODE_GQL,
+            variable_values=dict(name=self.name, tenant=self.tenant),
+        )["GetNode"]
+        self._config: dict[str, Any] = (
+            json.loads(data["tenant"].get("config", {}))
+            | json.loads(data["app"].get("config", {}))
+            | json.loads(data.get("config", {}))
+        )
+        if receive_message_type := data.get("receiveMessageType"):
+            self._receive_message_type = receive_message_type["name"]
+            self._receive_message_auditor = dynamic_function_loader.load(
+                receive_message_type["auditor"]
+            )
+        if send_message_type := data.get("sendMessageType"):
+            self._send_message_type = send_message_type["name"]
+            self._send_message_auditor: Auditor = dynamic_function_loader.load(
+                send_message_type["auditor"]
+            )
+        self._sources = frozenset(
+            {
+                Edge(name=edge["source"]["name"], queue=edge["queue"])
+                for edge in data["receiveEdges"]
+            }
+        )
+        self._targets = frozenset(
+            {
+                Edge(name=edge["target"]["name"], queue=edge["queue"])
+                for edge in data["sendEdges"]
+            }
+        )
+        self.__receive_audit_records_queue = __AuditRecordQueue(
+            self._receive_message_type, "Receive", self
+        )
+        self.__send_audit_records_queue = __AuditRecordQueue(
+            self._send_message_type, "Send", self
+        )
+        self.__target_message_queues = {
+            edge.name: __TargetMessageQueue(self, edge) for edge in self.targets
+        }
+
+    def stop(self) -> None:
+        for target_message_queue in self.__target_message_queues.values():
+            target_message_queue.stop()
+        self.__receive_audit_records_queue.stop()
+        self.__send_audit_records_queue.stop()
+
 
 class __DeleteMessageQueue(Queue):
-    def __init__(self, node: Node, queue: str, source: str) -> None:
+    def __init__(self, edge: Edge, node: Node) -> None:
         super().__init__()
+        self.__continue = Event()
+        self.__continue.set()
 
         def deleter() -> None:
-            while True:
+            while self.__continue.is_set() or not self.empty():
                 receipt_handles: list[str] = list()
                 while len(receipt_handles) < 10:
                     try:
-                        receipt_handles.append(self.__get())
+                        receipt_handles.append(self.get(timeout=0.1))
                     except Empty:
                         break
                 if not receipt_handles:
                     continue
                 try:
                     response = node.sqs_client.delete_message_batch(
-                        QueueUrl=queue,
                         Entries=[
                             DeleteMessageBatchRequestEntryTypeDef(
                                 Id=str(id), ReceiptHandle=receipt_handle
                             )
                             for id, receipt_handle in enumerate(receipt_handles)
                         ],
+                        QueueUrl=edge.queue,
                     )
                     for failed in response["Failed"]:
                         id = failed.pop("Id")
                         getLogger().error(
-                            f"Unable to delete message {receipt_handles[id]} from {source}, reason {failed}"
+                            f"Unable to delete message {receipt_handles[id]} from {edge.name}, reason {failed}"
                         )
                 except Exception:
-                    getLogger().exception(f"Error deleting messages from {source}")
+                    getLogger().exception(f"Error deleting messages from {edge.name}")
                 finally:
                     for _ in range(len(receipt_handles)):
                         self.task_done()
 
         Thread(
-            daemon=True, name=f"SourceMessageDeleter({source})", target=deleter
+            daemon=True, name=f"SourceMessageDeleter({edge.name})", target=deleter
         ).start()
 
-    def __get(self) -> str:
-        return self.get(block=True, timeout=0.1)
+    def get(self, block: bool = True, timeout: float = None) -> str:
+        return self.get(block=block, timeout=timeout)
+
+    def stop(self) -> None:
+        self.__continue.clear()
 
 
 class __SourceMessageReceiver(Thread):
-    def __init__(self, node: Node, queue: str, source: str) -> None:
-        super().__init__(daemon=True, name=f"AppNodeReceiver({source})")
+    def __init__(self, edge: Edge, node: Node) -> None:
+        super().__init__(
+            daemon=True, name=f"AppNodeReceiver({edge.name})", target=self.__receive
+        )
         self.__continue = Event()
         self.__continue.set()
-        self.__delete_message_queue = __DeleteMessageQueue(node, queue, source)
+        self.__delete_message_queue = __DeleteMessageQueue(edge, node)
         self.__node = node
-        self.__queue = queue
-        self.__source = source
+        self.__edge = edge
         self.start()
 
-    def join(self) -> None:
-        self.__delete_message_queue.join()
-        super().join()
-
-    def run(self) -> None:
-        getLogger().info(f"Receiving messages from {self.__source}")
+    def __receive(self) -> None:
+        self.__continue.wait()
+        getLogger().info(f"Receiving messages from {self.__edge.name}")
         error_count = 0
         while self.__continue.is_set():
             try:
@@ -341,7 +404,7 @@ class __SourceMessageReceiver(Thread):
                     AttributeNames=["All"],
                     MaxNumberOfMessages=10,
                     MessageAttributeNames=["All"],
-                    QueueUrl=self.__queue,
+                    QueueUrl=self.__edge.queue,
                     WaitTimeSeconds=20,
                 )
                 error_count = 0
@@ -351,17 +414,19 @@ class __SourceMessageReceiver(Thread):
                     and e.response["Error"]["Code"]
                     == "AWS.SimpleQueueService.NonExistentQueue"
                 ):
-                    getLogger().warning(f"Queue {self.__queue} does not exist, exiting")
+                    getLogger().warning(
+                        f"Queue {self.__edge.queue} does not exist, exiting"
+                    )
                     break
                 error_count += 1
                 if error_count == 10:
                     getLogger().critical(
-                        f"Recevied 10 errors in a row trying to receive from {self.__source}, exiting"
+                        f"Recevied 10 errors in a row trying to receive from {self.__edge.queue}, exiting"
                     )
                     raise e
                 else:
                     getLogger().exception(
-                        f"Error receiving messages from {self.__source}, retrying"
+                        f"Error receiving messages from {self.__edge.name}, retrying"
                     )
                     sleep(10)
             else:
@@ -383,22 +448,27 @@ class __SourceMessageReceiver(Thread):
                         )
                     )
                     receipt_handles.append(sqs_message["ReceiptHandle"])
-                getLogger().info(f"Received {len(messages)} from {self.__source}")
+                getLogger().info(f"Received {len(messages)} from {self.__edge.name}")
                 try:
                     self.__node.handle_received_messages(
-                        messages=messages, source=self.__source
+                        messages=messages, source=self.__edge.name
                     )
                 except Exception:
                     getLogger().exception(
-                        f"Error handling recevied messages for {self.__source}"
+                        f"Error handling recevied messages for {self.__edge.name}"
                     )
                 else:
                     for receipt_handle in receipt_handles:
                         self.__delete_message_queue.put_nowait(receipt_handle)
-        getLogger().info(f"Stopping receiving messages from {self.__source}")
+        getLogger().info(f"Stopping receiving messages from {self.__edge.name}")
+
+    def join(self) -> None:
+        super().join()
+        self.__delete_message_queue.join()
 
     def stop(self) -> None:
         self.__continue.clear()
+        self.__delete_message_queue.stop()
 
 
 class AppNode(Node):
@@ -424,35 +494,51 @@ class AppNode(Node):
         )
         self.__source_message_receivers: list[__SourceMessageReceiver] = list()
 
-    def _initialize_edges(self) -> None:
-        super()._initialize_edges()
-        with self._lock:
-            for app_node_receiver in self.__source_message_receivers:
-                app_node_receiver.stop()
-            for app_node_receiver in self.__source_message_receivers:
-                app_node_receiver.join()
-            self.__source_message_receivers = [
-                __SourceMessageReceiver(self, edge.queue, edge.name) for edge in self.sources
-            ]
-
     def join(self) -> None:
-        with self._lock:
-            for app_node_receiver in self.__source_message_receivers:
-                app_node_receiver.join()
+        for app_node_receiver in self.__source_message_receivers:
+            app_node_receiver.join()
         super().join()
 
+    def start(self) -> None:
+        super().start()
+        self.__source_message_receivers = [
+            __SourceMessageReceiver(edge, self) for edge in self.sources
+        ]
+
     def stop(self):
-        with self._lock:
-            for app_node_receiver in self.__source_message_receivers:
-                app_node_receiver.stop()
+        for app_node_receiver in self.__source_message_receivers:
+            app_node_receiver.stop()
+        super().stop()
 
 
 class LambdaNode(Node):
+    def __init__(
+        self,
+        *,
+        appsync_endpoint: str = None,
+        client_id: str = None,
+        name: str = None,
+        password: str = None,
+        tenant: str = None,
+        user_pool_id: str = None,
+        username: str = None,
+    ) -> None:
+        super().__init__(
+            appsync_endpoint=appsync_endpoint,
+            client_id=client_id,
+            name=name,
+            password=password,
+            tenant=tenant,
+            user_pool_id=user_pool_id,
+            username=username,
+        )
+        self.start()
+
     def _get_source(self, queue_arn: str) -> str:
         return self.__queue_name_to_source[queue_arn.split(":")[-1:][0]]
 
-    def _initialize_edges(self) -> None:
-        super()._initialize_edges()
+    def start(self) -> None:
+        super().start()
         self.__queue_name_to_source = {
             edge.queue.split("/")[-1:][0]: edge.name for edge in self.sources
         }

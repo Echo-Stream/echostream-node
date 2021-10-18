@@ -1,15 +1,13 @@
 from __future__ import annotations
 
-import json
 import logging
-from abc import ABC, abstractmethod
-from concurrent.futures import ThreadPoolExecutor, wait
+from abc import ABC
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from os import cpu_count, environ
 from typing import TYPE_CHECKING, Any, Callable, Union
 
-import dynamic_function_loader
+import simplejson as json
 from boto3.session import Session
 from botocore.config import Config
 from botocore.credentials import DeferredRefreshableCredentials
@@ -106,7 +104,7 @@ _GET_APP_GQL = gql(
     """
 )
 
-_GET_CONFIG_GQL = gql(
+_GET_NODE_GQL = gql(
     """
     query getNode($name: String!, $tenant: $String!) {
         GetNode(name: $name, tenant: $tenant) {
@@ -120,12 +118,52 @@ _GET_CONFIG_GQL = gql(
                     }
                 }
                 config
+                receiveEdges {
+                    queue
+                    source {
+                        name
+                    }
+                }
+                receiveMessageType {
+                    auditor
+                    name
+                }
+                sendEdges {
+                    queue
+                    target {
+                        name
+                    }
+                }
+                sendMessageType {
+                    auditor
+                    name
+                }
             }
             ... on ManagedNode {
                 app {
                     config
                 }
                 config
+                receiveEdges {
+                    queue
+                    source {
+                        name
+                    }
+                }
+                receiveMessageType {
+                    auditor
+                    name
+                }
+                sendEdges {
+                    queue
+                    target {
+                        name
+                    }
+                }
+                sendMessageType {
+                    auditor
+                    name
+                }
             }
             tenant {
                 config
@@ -135,75 +173,9 @@ _GET_CONFIG_GQL = gql(
     """
 )
 
-_GET_MESSAGE_TYPES = gql(
-    """
-    query getNode($name: String!, $tenant: $String!) {
-        GetNode(name: $name, tenant: $tenant) {
-            ... on ExternalNode {
-                receiveMessageType {
-                    auditor
-                    name
-                }
-                sendMessageType {
-                    auditor
-                    name
-                }
-            }
-            ... on ManagedNode {
-                receiveMessageType {
-                    auditor
-                    name
-                }
-                sendMessageType {
-                    auditor
-                    name
-                }
-            }
-        }
-    }
-    """
-)
-
-_GET_EDGES = gql(
-    """
-    query getNode($name: String!, $tenant: $String!) {
-        GetNode(name: $name, tenant: $tenant) {
-            ... on ExternalNode {
-                receiveEdges {
-                    queue
-                    source {
-                        name
-                    }
-                }
-                sendEdges {
-                    queue
-                    target {
-                        name
-                    }
-                }
-            }
-            ... on ManagedNode {
-                receiveEdges {
-                    queue
-                    source {
-                        name
-                    }
-                }
-                sendEdges {
-                    queue
-                    target {
-                        name
-                    }
-                }
-            }
-        }
-    }
-    """
-)
-
 
 class __NodeSession(BotocoreSession):
-    def __init__(self, node: BaseNode, duration: int = 900) -> None:
+    def __init__(self, node: Node, duration: int = 900) -> None:
         super().__init__()
 
         def refresher():
@@ -249,7 +221,30 @@ class AuditRecord:
         super().__setattr__("tracking_id", message.tracking_id)
 
 
-class BaseNode(ABC):
+@dataclass(frozen=True, init=False)
+class BulkDataStorage:
+    presigned_get: str
+    presigned_post: PresignedPost
+
+    def __init__(self, bulk_data_storage: dict[str, Union[str, PresignedPost]]) -> None:
+        self.presigned_get = bulk_data_storage["presignedGet"]
+        self.presigned_post = PresignedPost(
+            expiration=datetime.fromisoformat(
+                bulk_data_storage["presignedPost"]["expiration"]
+            ),
+            fields=bulk_data_storage["presignedPost"]["fields"],
+            url=bulk_data_storage["presignedPost"]["url"],
+        )
+
+    @property
+    def expired(self) -> bool:
+        return self.presigned_post.expiration < datetime.utcnow()
+
+
+LambdaEvent = Union[bool, dict, float, int, list, str, tuple, None]
+
+
+class Node(ABC):
     def __init__(
         self,
         *,
@@ -297,67 +292,13 @@ class BaseNode(ABC):
                 retries={"mode": "standard"},
             ),
         )
-        self._initialize()
-
-    def __initialize_config(self) -> None:
-        data: dict[str, dict] = self.gql_client.execute(
-            _GET_CONFIG_GQL,
-            variable_values=dict(name=self.name, tenant=self.tenant),
-        )["GetNode"]
-        self._config: dict[str, Any] = (
-            json.loads(data["tenant"].get("config", {}))
-            | json.loads(data["app"].get("config", {}))
-            | json.loads(data.get("config", {}))
-        )
-
-    def __initialize_message_types(self) -> None:
-        data: dict[str, Any] = self.gql_client.execute(
-            _GET_MESSAGE_TYPES,
-            variable_values=dict(name=self.name, tenant=self.tenant),
-        )["GetNode"]
-        self.__receive_message_type: str = None
-        self.__receive_message_auditor: Auditor = None
-        if receive_message_type := data.get("receiveMessageType"):
-            self.__receive_message_type = receive_message_type["name"]
-            self.__receive_message_auditor = dynamic_function_loader.load(
-                receive_message_type["auditor"]
-            )
-        self.__send_message_type: str = None
-        self.__send_message_auditor = None
-        if send_message_type := data.get("sendMessageType"):
-            self.__send_message_type = send_message_type["name"]
-            self.__send_message_auditor: Auditor = dynamic_function_loader.load(
-                send_message_type["auditor"]
-            )
-
-    def _initialize(self):
-        with ThreadPoolExecutor() as executor:
-            wait(
-                [
-                    executor.submit(self.__initialize_config),
-                    executor.submit(self._initialize_edges),
-                    executor.submit(self.__initialize_message_types),
-                ]
-            )
-
-    @abstractmethod
-    def _initialize_edges(self) -> None:
-        data: dict[str, list[dict[str, Union[str, dict]]]] = self.gql_client.execute(
-            _GET_EDGES,
-            variable_values=dict(name=self.name, tenant=self.tenant),
-        )
-        self.__sources = frozenset(
-            {
-                Edge(name=edge["source"]["name"], queue=edge["queue"])
-                for edge in data["receiveEdges"]
-            }
-        )
-        self.__targets = frozenset(
-            {
-                Edge(name=edge["target"]["name"], queue=edge["queue"])
-                for edge in data["sendEdges"]
-            }
-        )
+        self._config: dict[str, Any] = None
+        self._receive_message_type: str = None
+        self._receive_message_auditor: Auditor = None
+        self._send_message_type: str = None
+        self._send_message_auditor = None
+        self._sources: frozenset[Edge] = None
+        self._targets: frozenset[Edge] = None
 
     @property
     def app(self) -> str:
@@ -385,23 +326,23 @@ class BaseNode(ABC):
 
     @property
     def receive_message_auditor(self) -> Auditor:
-        return self.__receive_message_auditor or (lambda x: {})
+        return self._receive_message_auditor or (lambda x: {})
 
     @property
     def receive_message_type(self) -> str:
-        return self.__receive_message_type
+        return self._receive_message_type
 
     @property
     def send_message_auditor(self) -> Auditor:
-        return self.__send_message_auditor or (lambda x: {})
+        return self._send_message_auditor or (lambda x: {})
 
     @property
     def send_message_type(self) -> str:
-        return self.__send_message_type
+        return self._send_message_type
 
     @property
     def sources(self) -> frozenset[Edge]:
-        return self.__sources
+        return self._sources
 
     @property
     def sqs_client(self) -> SQSClient:
@@ -409,34 +350,11 @@ class BaseNode(ABC):
 
     @property
     def targets(self) -> frozenset[Edge]:
-        return self.__targets
+        return self._targets
 
     @property
     def tenant(self) -> str:
         return self.__tenant
-
-
-@dataclass(frozen=True, init=False)
-class BulkDataStorage:
-    presigned_get: str
-    presigned_post: PresignedPost
-
-    def __init__(self, bulk_data_storage: dict[str, Union[str, PresignedPost]]) -> None:
-        self.presigned_get = bulk_data_storage["presignedGet"]
-        self.presigned_post = PresignedPost(
-            expiration=datetime.fromisoformat(
-                bulk_data_storage["presignedPost"]["expiration"]
-            ),
-            fields=bulk_data_storage["presignedPost"]["fields"],
-            url=bulk_data_storage["presignedPost"]["url"],
-        )
-
-    @property
-    def expired(self) -> bool:
-        return self.presigned_post.expiration < datetime.utcnow()
-
-
-LambdaEvent = Union[bool, dict, float, int, list, str, tuple, None]
 
 
 @dataclass(frozen=True, init=False)
@@ -451,7 +369,7 @@ class Message:
         body: str,
         tracking_id: str,
         group_id: str = None,
-        node: BaseNode = None,
+        node: Node = None,
         previous_tracking_ids: Union[set[str], list[str], str] = None,
     ) -> None:
         super().__init__()
