@@ -264,6 +264,11 @@ class Node(BaseNode):
     def put_audit_record(self, audit_record: AuditRecord) -> None:
         self.__audit_records_queue.put_nowait(audit_record)
 
+    def restart(self) -> None:
+        self.stop()
+        self.join()
+        self.start()
+
     def send_message(self, /, message: Message, *, targets: set[str] = None) -> None:
         self.send_messages([message], targets=targets)
 

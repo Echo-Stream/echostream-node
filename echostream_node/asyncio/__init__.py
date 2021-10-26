@@ -453,6 +453,11 @@ class Node(BaseNode):
     def put_audit_record(self, audit_record: AuditRecord) -> None:
         self.__audit_records_queue.put_nowait(audit_record)
 
+    async def restart(self) -> None:
+        await self.stop()
+        await self.join()
+        await self.start()
+
     async def send_message(
         self, /, message: Message, *, targets: set[str] = None
     ) -> None:
@@ -508,7 +513,7 @@ class Node(BaseNode):
             __SourceMessageReceiver(edge, self) for edge in self._sources
         ]
 
-    def stop(self) -> None:
+    async def stop(self) -> None:
         self.__running = False
         for app_node_receiver in self.__source_message_receivers:
             app_node_receiver.stop()
