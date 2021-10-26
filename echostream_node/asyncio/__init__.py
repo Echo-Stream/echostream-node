@@ -28,7 +28,6 @@ from .. import (
     _CREATE_AUDIT_RECORDS,
     _GET_BULK_DATA_STORAGE_GQL,
     _GET_NODE_GQL,
-    Auditor,
     AuditRecord,
     BulkDataStorage,
     Edge,
@@ -48,10 +47,9 @@ else:
 
 
 class __AuditRecordQueue(Queue):
-    def __init__(self, message_type: str, name_prefix: str, node: Node) -> None:
+    def __init__(self, message_type: str, node: Node) -> None:
         super().__init__()
         self.__message_type = message_type
-        self.__name_prefix = name_prefix
         self.__node = node
         self.__task: Task = None
 
@@ -76,7 +74,7 @@ class __AuditRecordQueue(Queue):
     async def __sender(self) -> None:
         async for batch in self.__batcher():
             try:
-                async with self.__node.gql_client as session:
+                async with self.__node._gql_client as session:
                     await session.execute(
                         _CREATE_AUDIT_RECORDS,
                         variable_values=dict(
@@ -108,9 +106,7 @@ class __AuditRecordQueue(Queue):
 
     def _put(self, item: Any) -> None:
         if self.empty() and (not self.__task or self.__task.done()):
-            self.__task = create_task(
-                self.__sender(), name=f"{self.__name_prefix}AuditRecordsSender"
-            )
+            self.__task = create_task(self.__sender(), name=f"AuditRecordsSender")
         return super()._put(item)
 
     async def get(self) -> AuditRecord:
@@ -125,7 +121,7 @@ class __BulkDataStorageQueue(Queue):
         self.__filler_task: Task = None
 
     async def __filler(self) -> None:
-        async with self.__node.gql_client as session:
+        async with self.__node._gql_client as session:
             bulk_data_storages = await session.execute(
                 _GET_BULK_DATA_STORAGE_GQL,
                 variable_values={"tenant", self.__node.tenant},
@@ -181,7 +177,7 @@ class __DeleteMessageQueue(Queue):
     async def __batcher(
         self,
     ) -> AsyncGenerator[list[str], None,]:
-        batch: list[AuditRecord] = list()
+        batch: list[str] = list()
         while not self.empty():
             try:
                 batch.append(await wait_for(self.get(), timeout=0.1))
@@ -203,7 +199,7 @@ class __DeleteMessageQueue(Queue):
                 response = await loop.run_in_executor(
                     None,
                     partial(
-                        self.__node.sqs_client.delete_message_batch,
+                        self.__node._sqs_client.delete_message_batch,
                         Entries=[
                             DeleteMessageBatchRequestEntryTypeDef(
                                 Id=str(id), ReceiptHandle=receipt_handle
@@ -266,7 +262,7 @@ class __SourceMessageReceiver:
                 response = await loop.run_in_executor(
                     None,
                     partial(
-                        self.__node.sqs_client.receive_message,
+                        self.__node._sqs_client.receive_message,
                         AttributeNames=["All"],
                         MaxNumberOfMessages=10,
                         MessageAttributeNames=["All"],
@@ -297,35 +293,33 @@ class __SourceMessageReceiver:
                     )
                     await sleep(10)
             else:
-                if not (self.__continue.is_set() and response["Messages"]):
+                sqs_messages = response["Messages"]
+                if not (self.__continue.is_set() and sqs_messages):
                     continue
-                messages: list[Message] = list()
-                receipt_handles: list[str] = list()
-                for sqs_message in response["Messages"]:
-                    messages.append(
-                        Message(
-                            body=sqs_message["Body"],
-                            group_id=sqs_message["Attributes"]["MessageGroupId"],
-                            tracking_id=sqs_message["MessageAttributes"]
-                            .get("trackingId", {})
-                            .get("StringValue"),
-                            previous_tracking_ids=sqs_message["MessageAttributes"]
-                            .get("prevTrackingIds", {})
-                            .get("StringValue"),
+                getLogger().info(
+                    f"Received {len(sqs_messages)} from {self.__edge.name}"
+                )
+                for sqs_message in sqs_messages:
+                    message = Message(
+                        body=sqs_message["Body"],
+                        group_id=sqs_message["Attributes"]["MessageGroupId"],
+                        tracking_id=sqs_message["MessageAttributes"]
+                        .get("trackingId", {})
+                        .get("StringValue"),
+                        previous_tracking_ids=sqs_message["MessageAttributes"]
+                        .get("prevTrackingIds", {})
+                        .get("StringValue"),
+                    )
+                    receipt_handle = sqs_message["ReceiptHandle"]
+                    try:
+                        await self.__node.handle_received_message(
+                            message=message, source=self.__edge.name
                         )
-                    )
-                    receipt_handles.append(sqs_message["ReceiptHandle"])
-                getLogger().info(f"Received {len(messages)} from {self.__edge.name}")
-                try:
-                    await self.__node.handle_received_messages(
-                        messages=messages, source=self.__edge.name
-                    )
-                except Exception:
-                    getLogger().exception(
-                        f"Error handling recevied messages for {self.__edge.name}"
-                    )
-                else:
-                    for receipt_handle in receipt_handles:
+                    except Exception:
+                        getLogger().exception(
+                            f"Error handling recevied message for {self.__edge.name}"
+                        )
+                    else:
                         self.__delete_message_queue.put_nowait(receipt_handle)
         getLogger().info(f"Stopping receiving messages from {self.__edge.name}")
 
@@ -385,7 +379,7 @@ class __TargetMessageQueue(Queue):
                 response = await loop.run_in_executor(
                     None,
                     partial(
-                        self.__node.sqs_client.send_message_batch,
+                        self.__node._sqs_client.send_message_batch,
                         Entries=entries,
                         QueueUrl=self.__edge.queue,
                     ),
@@ -435,34 +429,29 @@ class Node(BaseNode):
             username=username,
         )
         self.__bulk_data_storage_queue: __BulkDataStorageQueue = None
-        self.__receive_audit_records_queue: __AuditRecordQueue = None
+        self.__audit_records_queue: __AuditRecordQueue = None
         self.__running = False
-        self.__send_audit_records_queue: __AuditRecordQueue = None
         self.__source_message_receivers: list[__SourceMessageReceiver] = list()
         self.__target_message_queues: dict[str, __TargetMessageQueue] = dict()
 
     async def handle_bulk_data(self, data: Union[bytearray, bytes]) -> str:
         return await (await self.__bulk_data_storage_queue.get()).handle_bulk_data(data)
 
-    async def handle_received_messages(
-        self, *, messages: list[Message], source: str
-    ) -> None:
-        for message in messages:
-            self.__receive_audit_records_queue.put_nowait(
-                AuditRecord(self.receive_message_auditor, message, source)
-            )
+    async def handle_received_message(self, *, message: Message, source: str) -> None:
+        pass
 
     async def join(self) -> None:
         for app_node_receiver in self.__source_message_receivers:
             app_node_receiver.join()
         for target_message_queue in self.__target_message_queues.values():
             await target_message_queue.join()
-        if self.__receive_audit_records_queue:
-            await self.__receive_audit_records_queue.join()
-        if self.__send_audit_records_queue:
-            await self.__send_audit_records_queue.join()
+        if self.__audit_records_queue:
+            await self.__audit_records_queue.join()
         if not self.__running and self.__bulk_data_storage_queue:
             await self.__bulk_data_storage_queue._stop()
+
+    def put_audit_record(self, audit_record: AuditRecord) -> None:
+        self.__audit_records_queue.put_nowait(audit_record)
 
     async def send_message(
         self, /, message: Message, *, targets: set[str] = None
@@ -473,23 +462,20 @@ class Node(BaseNode):
         self, /, messages: list[Message], *, targets: set[str] = None
     ) -> None:
         if messages:
-            for target in targets or self.targets:
+            for target in targets or self._targets:
                 target_message_queue = self.__target_message_queues[target]
                 for message in messages:
                     target_message_queue.put_nowait(message)
-                    self.__send_audit_records_queue.put_nowait(
-                        AuditRecord(self.send_message_auditor, message)
-                    )
 
     async def start(self) -> None:
         self.__running = True
         self.__bulk_data_storage_queue = __BulkDataStorageQueue(self)
-        async with self.gql_client as session:
+        async with self._gql_client as session:
             data: dict[str, dict] = await session.execute(
                 _GET_NODE_GQL,
                 variable_values=dict(name=self.name, tenant=self.tenant),
             )["GetNode"]
-        self._config: dict[str, Any] = (
+        self.config = (
             json.loads(data["tenant"].get("config", {}))
             | json.loads(data["app"].get("config", {}))
             | json.loads(data.get("config", {}))
@@ -501,32 +487,25 @@ class Node(BaseNode):
             )
         if send_message_type := data.get("sendMessageType"):
             self._send_message_type = send_message_type["name"]
-            self._send_message_auditor: Auditor = dynamic_function_loader.load(
+            self._send_message_auditor = dynamic_function_loader.load(
                 send_message_type["auditor"]
             )
-        self._sources = frozenset(
-            {
-                Edge(name=edge["source"]["name"], queue=edge["queue"])
-                for edge in data["receiveEdges"]
-            }
-        )
-        self._targets = frozenset(
-            {
-                Edge(name=edge["target"]["name"], queue=edge["queue"])
-                for edge in data["sendEdges"]
-            }
-        )
-        self.__receive_audit_records_queue = __AuditRecordQueue(
-            self._receive_message_type, "Receive", self
-        )
-        self.__send_audit_records_queue = __AuditRecordQueue(
-            self._send_message_type, "Send", self
+        self._sources = {
+            Edge(name=edge["source"]["name"], queue=edge["queue"])
+            for edge in data["receiveEdges"]
+        }
+        self._targets = {
+            Edge(name=edge["target"]["name"], queue=edge["queue"])
+            for edge in data["sendEdges"]
+        }
+        self.__audit_records_queue = __AuditRecordQueue(
+            self._receive_message_type, self
         )
         self.__target_message_queues = {
-            edge.name: __TargetMessageQueue(self, edge) for edge in self.targets
+            edge.name: __TargetMessageQueue(self, edge) for edge in self._targets
         }
         self.__source_message_receivers = [
-            __SourceMessageReceiver(edge, self) for edge in self.sources
+            __SourceMessageReceiver(edge, self) for edge in self._sources
         ]
 
     def stop(self) -> None:

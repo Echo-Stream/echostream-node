@@ -179,7 +179,7 @@ class __NodeSession(BotocoreSession):
         super().__init__()
 
         def refresher():
-            credentials = node.gql_client.execute(
+            credentials = node._gql_client.execute(
                 _GET_CREDENTIALS_GQL,
                 variable_values=dict(
                     name=node.app, tenant=node.tenant, duration=duration
@@ -212,9 +212,11 @@ class AuditRecord:
     previous_tracking_ids: frozenset[str]
     source_node: str
 
-    def __init__(self, auditor: Auditor, message: Message, source: str = None) -> None:
+    def __init__(
+        self, *, attributes: dict[str, Any], message: Message, source: str = None
+    ) -> None:
         super().__init__()
-        super().__setattr__("attributes", auditor(message.body))
+        super().__setattr__("attributes", attributes)
         super().__setattr__("date_time", datetime.now(timezone.utc))
         super().__setattr__("previous_tracking_ids", message.previous_tracking_ids)
         super().__setattr__("source_node", source)
@@ -241,120 +243,13 @@ class BulkDataStorage:
         return self.presigned_post.expiration < datetime.utcnow()
 
 
+@dataclass(frozen=True)
+class Edge:
+    name: str
+    queue: str
+
+
 LambdaEvent = Union[bool, dict, float, int, list, str, tuple, None]
-
-
-class Node(ABC):
-    def __init__(
-        self,
-        *,
-        gql_transport_cls: type,
-        appsync_endpoint: str = None,
-        client_id: str = None,
-        name: str = None,
-        password: str = None,
-        tenant: str = None,
-        user_pool_id: str = None,
-        username: str = None,
-    ) -> None:
-        super().__init__()
-        cognito = Cognito(
-            client_id=client_id or environ["CLIENT_ID"],
-            user_pool_id=user_pool_id or environ["USER_POOL_ID"],
-            username=username or environ["USERNAME"],
-        )
-        cognito.authenticate(password=password or environ["PASSWORD"])
-        self.__client = GqlClient(
-            fetch_schema_from_transport=True,
-            transport=gql_transport_cls(
-                cognito,
-                appsync_endpoint or environ["APPSYNC_ENDPOINT"],
-            ),
-        )
-        self.__name = name or environ["NODE"]
-        self.__tenant = tenant or environ["TENANT"]
-        data = self.__client.execute(
-            _GET_APP_GQL,
-            variable_values=dict(name=self.__name, tenant=self.__tenant),
-        )["GetNode"]
-        self.__app = data["app"]["name"]
-        self.__node_type = data["__typename"]
-        self.__app_type = data["app"]["__typename"]
-        session: Session = None
-        if self.__node_type == "ExternalNode" and self.__app_type == "CrossAccountApp":
-            session = Session()
-        else:
-            session = Session(botocore_session=__NodeSession(self))
-        self.__sqs_client: SQSClient = session.client(
-            "sqs",
-            Config(
-                max_pool_connections=min(20, ((cpu_count() or 1) + 4) * 2),
-                retries={"mode": "standard"},
-            ),
-        )
-        self._config: dict[str, Any] = None
-        self._receive_message_type: str = None
-        self._receive_message_auditor: Auditor = None
-        self._send_message_type: str = None
-        self._send_message_auditor = None
-        self._sources: frozenset[Edge] = None
-        self._targets: frozenset[Edge] = None
-
-    @property
-    def app(self) -> str:
-        return self.__app
-
-    @property
-    def app_type(self) -> str:
-        return self.__app_type
-
-    @property
-    def config(self) -> dict[str, Any]:
-        return self._config
-
-    @property
-    def gql_client(self) -> GqlClient:
-        return self.__client
-
-    @property
-    def name(self) -> str:
-        return self.__name
-
-    @property
-    def node_type(self) -> str:
-        return self.__node_type
-
-    @property
-    def receive_message_auditor(self) -> Auditor:
-        return self._receive_message_auditor or (lambda x: {})
-
-    @property
-    def receive_message_type(self) -> str:
-        return self._receive_message_type
-
-    @property
-    def send_message_auditor(self) -> Auditor:
-        return self._send_message_auditor or (lambda x: {})
-
-    @property
-    def send_message_type(self) -> str:
-        return self._send_message_type
-
-    @property
-    def sources(self) -> frozenset[Edge]:
-        return self._sources
-
-    @property
-    def sqs_client(self) -> SQSClient:
-        return self.__sqs_client
-
-    @property
-    def targets(self) -> frozenset[Edge]:
-        return self._targets
-
-    @property
-    def tenant(self) -> str:
-        return self.__tenant
 
 
 @dataclass(frozen=True, init=False)
@@ -422,14 +317,133 @@ class Message:
         return message_attributes
 
 
+class Node(ABC):
+    def __init__(
+        self,
+        *,
+        gql_transport_cls: type,
+        appsync_endpoint: str = None,
+        client_id: str = None,
+        name: str = None,
+        password: str = None,
+        tenant: str = None,
+        user_pool_id: str = None,
+        username: str = None,
+    ) -> None:
+        super().__init__()
+        cognito = Cognito(
+            client_id=client_id or environ["CLIENT_ID"],
+            user_pool_id=user_pool_id or environ["USER_POOL_ID"],
+            username=username or environ["USERNAME"],
+        )
+        cognito.authenticate(password=password or environ["PASSWORD"])
+        self.__client = GqlClient(
+            fetch_schema_from_transport=True,
+            transport=gql_transport_cls(
+                cognito,
+                appsync_endpoint or environ["APPSYNC_ENDPOINT"],
+            ),
+        )
+        self.__name = name or environ["NODE"]
+        self.__tenant = tenant or environ["TENANT"]
+        data = self.__client.execute(
+            _GET_APP_GQL,
+            variable_values=dict(name=self.__name, tenant=self.__tenant),
+        )["GetNode"]
+        self.__app = data["app"]["name"]
+        self.__node_type = data["__typename"]
+        self.__app_type = data["app"]["__typename"]
+        session: Session = None
+        if self.__node_type == "ExternalNode" and self.__app_type == "CrossAccountApp":
+            session = Session()
+        else:
+            session = Session(botocore_session=__NodeSession(self))
+        self.__sqs_client: SQSClient = session.client(
+            "sqs",
+            Config(
+                max_pool_connections=min(20, ((cpu_count() or 1) + 4) * 2),
+                retries={"mode": "standard"},
+            ),
+        )
+        self.__config: dict[str, Any] = None
+        self._receive_message_auditor: Auditor = None
+        self._receive_message_type: str = None
+        self._send_message_auditor: Auditor = None
+        self._send_message_type: str = None
+        self.__sources: frozenset[Edge] = None
+        self.__targets: frozenset[Edge] = None
+
+    @property
+    def _gql_client(self) -> GqlClient:
+        return self.__client
+
+    @property
+    def _sources(self) -> frozenset[Edge]:
+        return self.__sources
+
+    @_sources.setter
+    def _sources(self, sources: set[Edge]) -> None:
+        self.__sources = frozenset(sources)
+
+    @property
+    def _sqs_client(self) -> SQSClient:
+        return self.__sqs_client
+
+    @property
+    def _targets(self) -> frozenset[Edge]:
+        return self.__targets
+
+    @_targets.setter
+    def _targets(self, targets: set[Edge]) -> None:
+        self.__targets = frozenset(targets)
+
+    @property
+    def app(self) -> str:
+        return self.__app
+
+    @property
+    def app_type(self) -> str:
+        return self.__app_type
+
+    @property
+    def config(self) -> dict[str, Any]:
+        return self.__config
+
+    @config.setter
+    def config(self, config: dict[str, Any]) -> None:
+        self.__config = config
+
+    @property
+    def name(self) -> str:
+        return self.__name
+
+    @property
+    def node_type(self) -> str:
+        return self.__node_type
+
+    @property
+    def receive_message_auditor(self) -> Auditor:
+        return self._receive_message_auditor or (lambda x: {})
+
+    @property
+    def receive_message_type(self) -> str:
+        return self._receive_message_type
+
+    @property
+    def send_message_type(self) -> str:
+        return self._send_message_type
+
+    @property
+    def send_message_auditor(self) -> Auditor:
+        return self._send_message_auditor or (lambda x: {})
+
+    @property
+    def tenant(self) -> str:
+        return self.__tenant
+
+
 @dataclass(frozen=True)
 class PresignedPost:
     expiration: datetime
     fields: dict[str, str]
     url: str
-
-
-@dataclass(frozen=True)
-class Edge:
-    name: str
-    queue: str

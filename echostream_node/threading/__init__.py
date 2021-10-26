@@ -19,7 +19,6 @@ from .. import (
     _CREATE_AUDIT_RECORDS,
     _GET_BULK_DATA_STORAGE_GQL,
     _GET_NODE_GQL,
-    Auditor,
     AuditRecord,
     BulkDataStorage,
     Edge,
@@ -40,7 +39,7 @@ else:
 
 
 class __AuditRecordQueue(Queue):
-    def __init__(self, message_type: str, name_prefix: str, node: Node) -> None:
+    def __init__(self, message_type: str, node: Node) -> None:
         super().__init__()
         self.__continue = Event()
         self.__continue.set()
@@ -56,7 +55,7 @@ class __AuditRecordQueue(Queue):
                 if not batch:
                     continue
                 try:
-                    node.gql_client.execute(
+                    node._gql_client.execute(
                         _CREATE_AUDIT_RECORDS,
                         variable_values=dict(
                             name=node.name,
@@ -85,9 +84,7 @@ class __AuditRecordQueue(Queue):
                     for _ in range(len(batch)):
                         self.task_done()
 
-        Thread(
-            daemon=True, name=f"{name_prefix}AuditRecordsSender", target=sender
-        ).start()
+        Thread(daemon=True, name=f"AuditRecordsSender", target=sender).start()
 
     def get(self, block: bool = True, timeout: float = None) -> AuditRecord:
         return self.get(block=block, timeout=timeout)
@@ -122,7 +119,7 @@ class __BulkDataStorageQueue(Queue):
                 if not self.empty():
                     with self.fill:
                         self.fill.wait()
-                bulk_data_storages = node.gql_client.execute(
+                bulk_data_storages = node._gql_client.execute(
                     _GET_BULK_DATA_STORAGE_GQL,
                     variable_values={"tenant", node.tenant},
                 )
@@ -201,7 +198,7 @@ class __TargetMessageQueue(Queue):
         def sender() -> None:
             for entries in batcher():
                 try:
-                    response = node.sqs_client.send_message_batch(
+                    response = node._sqs_client.send_message_batch(
                         Entries=entries, QueueUrl=edge.queue
                     )
                     for failed in response["Failed"]:
@@ -249,26 +246,23 @@ class Node(BaseNode):
             username=username,
         )
         self.__bulk_data_storage_queue = __BulkDataStorageQueue(self)
-        self.__receive_audit_records_queue: __AuditRecordQueue = None
-        self.__send_audit_records_queue: __AuditRecordQueue = None
+        self.__audit_records_queue: __AuditRecordQueue = None
         self.__target_message_queues: dict[str, __TargetMessageQueue] = dict()
 
     def handle_bulk_data(self, data: Union[bytearray, bytes]) -> str:
         return self.__bulk_data_storage_queue.get().handle_bulk_data(data)
 
-    def handle_received_messages(self, *, messages: list[Message], source: str) -> None:
-        for message in messages:
-            self.__receive_audit_records_queue.put_nowait(
-                AuditRecord(self.receive_message_auditor, message, source)
-            )
+    def handle_received_message(self, *, message: Message, source: str) -> None:
+        pass
 
     def join(self) -> None:
         for target_message_queue in self.__target_message_queues.values():
             target_message_queue.join()
-        if self.__receive_audit_records_queue:
-            self.__receive_audit_records_queue.join()
-        if self.__send_audit_records_queue:
-            self.__send_audit_records_queue.join()
+        if self.__audit_records_queue:
+            self.__audit_records_queue.join()
+
+    def put_audit_record(self, audit_record: AuditRecord) -> None:
+        self.__audit_records_queue.put_nowait(audit_record)
 
     def send_message(self, /, message: Message, *, targets: set[str] = None) -> None:
         self.send_messages([message], targets=targets)
@@ -277,20 +271,17 @@ class Node(BaseNode):
         self, /, messages: list[Message], *, targets: set[str] = None
     ) -> None:
         if messages:
-            for target in targets or self.targets:
+            for target in targets or self._targets:
                 target_message_queue = self.__target_message_queues[target]
                 for message in messages:
                     target_message_queue.put_nowait(message)
-                    self.__send_audit_records_queue.put_nowait(
-                        AuditRecord(self.send_message_auditor, message)
-                    )
 
     def start(self) -> None:
-        data: dict[str, dict] = self.gql_client.execute(
+        data: dict[str, dict] = self._gql_client.execute(
             _GET_NODE_GQL,
             variable_values=dict(name=self.name, tenant=self.tenant),
         )["GetNode"]
-        self._config: dict[str, Any] = (
+        self.config = (
             json.loads(data["tenant"].get("config", {}))
             | json.loads(data["app"].get("config", {}))
             | json.loads(data.get("config", {}))
@@ -302,36 +293,28 @@ class Node(BaseNode):
             )
         if send_message_type := data.get("sendMessageType"):
             self._send_message_type = send_message_type["name"]
-            self._send_message_auditor: Auditor = dynamic_function_loader.load(
+            self._send_message_auditor = dynamic_function_loader.load(
                 send_message_type["auditor"]
             )
-        self._sources = frozenset(
-            {
-                Edge(name=edge["source"]["name"], queue=edge["queue"])
-                for edge in data["receiveEdges"]
-            }
-        )
-        self._targets = frozenset(
-            {
-                Edge(name=edge["target"]["name"], queue=edge["queue"])
-                for edge in data["sendEdges"]
-            }
-        )
-        self.__receive_audit_records_queue = __AuditRecordQueue(
-            self._receive_message_type, "Receive", self
-        )
-        self.__send_audit_records_queue = __AuditRecordQueue(
-            self._send_message_type, "Send", self
+        self._sources = {
+            Edge(name=edge["source"]["name"], queue=edge["queue"])
+            for edge in data["receiveEdges"]
+        }
+        self._targets = {
+            Edge(name=edge["target"]["name"], queue=edge["queue"])
+            for edge in data["sendEdges"]
+        }
+        self.__audit_records_queue = __AuditRecordQueue(
+            self._receive_message_type, self
         )
         self.__target_message_queues = {
-            edge.name: __TargetMessageQueue(self, edge) for edge in self.targets
+            edge.name: __TargetMessageQueue(self, edge) for edge in self._targets
         }
 
     def stop(self) -> None:
         for target_message_queue in self.__target_message_queues.values():
             target_message_queue.stop()
-        self.__receive_audit_records_queue.stop()
-        self.__send_audit_records_queue.stop()
+        self.__audit_records_queue.stop()
 
 
 class __DeleteMessageQueue(Queue):
@@ -351,7 +334,7 @@ class __DeleteMessageQueue(Queue):
                 if not receipt_handles:
                     continue
                 try:
-                    response = node.sqs_client.delete_message_batch(
+                    response = node._sqs_client.delete_message_batch(
                         Entries=[
                             DeleteMessageBatchRequestEntryTypeDef(
                                 Id=str(id), ReceiptHandle=receipt_handle
@@ -400,7 +383,7 @@ class __SourceMessageReceiver(Thread):
         error_count = 0
         while self.__continue.is_set():
             try:
-                response = self.__node.sqs_client.receive_message(
+                response = self.__node._sqs_client.receive_message(
                     AttributeNames=["All"],
                     MaxNumberOfMessages=10,
                     MessageAttributeNames=["All"],
@@ -430,35 +413,33 @@ class __SourceMessageReceiver(Thread):
                     )
                     sleep(10)
             else:
-                if not (self.__continue.is_set() and response["Messages"]):
+                sqs_messages = response["Messages"]
+                if not (self.__continue.is_set() and sqs_messages):
                     continue
-                messages: list[Message] = list()
-                receipt_handles: list[str] = list()
-                for sqs_message in response["Messages"]:
-                    messages.append(
-                        Message(
-                            body=sqs_message["Body"],
-                            group_id=sqs_message["Attributes"]["MessageGroupId"],
-                            tracking_id=sqs_message["MessageAttributes"]
-                            .get("trackingId", {})
-                            .get("StringValue"),
-                            previous_tracking_ids=sqs_message["MessageAttributes"]
-                            .get("prevTrackingIds", {})
-                            .get("StringValue"),
+                getLogger().info(
+                    f"Received {len(sqs_messages)} from {self.__edge.name}"
+                )
+                for sqs_message in sqs_messages:
+                    message = Message(
+                        body=sqs_message["Body"],
+                        group_id=sqs_message["Attributes"]["MessageGroupId"],
+                        tracking_id=sqs_message["MessageAttributes"]
+                        .get("trackingId", {})
+                        .get("StringValue"),
+                        previous_tracking_ids=sqs_message["MessageAttributes"]
+                        .get("prevTrackingIds", {})
+                        .get("StringValue"),
+                    )
+                    receipt_handle = sqs_message["ReceiptHandle"]
+                    try:
+                        self.__node.handle_received_message(
+                            message=message, source=self.__edge.name
                         )
-                    )
-                    receipt_handles.append(sqs_message["ReceiptHandle"])
-                getLogger().info(f"Received {len(messages)} from {self.__edge.name}")
-                try:
-                    self.__node.handle_received_messages(
-                        messages=messages, source=self.__edge.name
-                    )
-                except Exception:
-                    getLogger().exception(
-                        f"Error handling recevied messages for {self.__edge.name}"
-                    )
-                else:
-                    for receipt_handle in receipt_handles:
+                    except Exception:
+                        getLogger().exception(
+                            f"Error handling recevied message for {self.__edge.name}"
+                        )
+                    else:
                         self.__delete_message_queue.put_nowait(receipt_handle)
         getLogger().info(f"Stopping receiving messages from {self.__edge.name}")
 
@@ -502,10 +483,10 @@ class AppNode(Node):
     def start(self) -> None:
         super().start()
         self.__source_message_receivers = [
-            __SourceMessageReceiver(edge, self) for edge in self.sources
+            __SourceMessageReceiver(edge, self) for edge in self._sources
         ]
 
-    def stop(self):
+    def stop(self) -> None:
         for app_node_receiver in self.__source_message_receivers:
             app_node_receiver.stop()
         super().stop()
@@ -540,7 +521,7 @@ class LambdaNode(Node):
     def start(self) -> None:
         super().start()
         self.__queue_name_to_source = {
-            edge.queue.split("/")[-1:][0]: edge.name for edge in self.sources
+            edge.queue.split("/")[-1:][0]: edge.name for edge in self._sources
         }
 
     def handle_event(self, event: LambdaEvent) -> None:
@@ -561,13 +542,12 @@ class LambdaNode(Node):
             getLogger().warning(f"No Records found in event {event}")
             return
         source: str = None
-        messages: list[Message] = list()
-        for record in records:
-            if not source:
-                source = self._get_source(record["eventSourceARN"])
-                getLogger().info(f"Received {len(records)} messages from {source}")
-            messages.append(
-                Message(
+        try:
+            for record in records:
+                if not source:
+                    source = self._get_source(record["eventSourceARN"])
+                    getLogger().info(f"Received {len(records)} messages from {source}")
+                message = Message(
                     body=record["body"],
                     group_id=record["attributes"]["MessageGroupId"],
                     previous_tracking_ids=record["messageAttributes"]
@@ -578,9 +558,6 @@ class LambdaNode(Node):
                     .get("stringValue")
                     or uuid4().hex,
                 )
-            )
-        try:
-            if messages:
-                self.handle_received_messages(messages=messages, source=source)
+                self.handle_received_message(message=message, source=source)
         finally:
             self.join()
