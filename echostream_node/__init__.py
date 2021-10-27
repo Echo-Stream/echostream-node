@@ -337,7 +337,7 @@ class Node(ABC):
             username=username or environ["USERNAME"],
         )
         cognito.authenticate(password=password or environ["PASSWORD"])
-        self.__client = GqlClient(
+        self.__gql_client = GqlClient(
             fetch_schema_from_transport=True,
             transport=gql_transport_cls(
                 cognito,
@@ -346,7 +346,7 @@ class Node(ABC):
         )
         self.__name = name or environ["NODE"]
         self.__tenant = tenant or environ["TENANT"]
-        data = self.__client.execute(
+        data = self.__gql_client.execute(
             _GET_APP_GQL,
             variable_values=dict(name=self.__name, tenant=self.__tenant),
         )["GetNode"]
@@ -375,7 +375,7 @@ class Node(ABC):
 
     @property
     def _gql_client(self) -> GqlClient:
-        return self.__client
+        return self.__gql_client
 
     @property
     def _sources(self) -> frozenset[Edge]:
