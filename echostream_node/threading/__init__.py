@@ -247,6 +247,7 @@ class Node(BaseNode):
         )
         self.__bulk_data_storage_queue = __BulkDataStorageQueue(self)
         self.__audit_records_queue: __AuditRecordQueue = None
+        self.__stop = Event()
         self.__target_message_queues: dict[str, __TargetMessageQueue] = dict()
 
     def handle_bulk_data(self, data: Union[bytearray, bytes]) -> str:
@@ -256,6 +257,7 @@ class Node(BaseNode):
         pass
 
     def join(self) -> None:
+        self.__stop.wait()
         for target_message_queue in self.__target_message_queues.values():
             target_message_queue.join()
         if self.__audit_records_queue:
@@ -263,11 +265,6 @@ class Node(BaseNode):
 
     def put_audit_record(self, audit_record: AuditRecord) -> None:
         self.__audit_records_queue.put_nowait(audit_record)
-
-    def restart(self) -> None:
-        self.stop()
-        self.join()
-        self.start()
 
     def send_message(self, /, message: Message, *, targets: set[str] = None) -> None:
         self.send_messages([message], targets=targets)
@@ -282,6 +279,7 @@ class Node(BaseNode):
                     target_message_queue.put_nowait(message)
 
     def start(self) -> None:
+        self.__stop.clear()
         data: dict[str, dict] = self._gql_client.execute(
             _GET_NODE_GQL,
             variable_values=dict(name=self.name, tenant=self.tenant),
@@ -320,6 +318,7 @@ class Node(BaseNode):
         for target_message_queue in self.__target_message_queues.values():
             target_message_queue.stop()
         self.__audit_records_queue.stop()
+        self.__stop.set()
 
 
 class __DeleteMessageQueue(Queue):
@@ -444,8 +443,7 @@ class __SourceMessageReceiver(Thread):
                         getLogger().exception(
                             f"Error handling recevied message for {self.__edge.name}"
                         )
-                    else:
-                        self.__delete_message_queue.put_nowait(receipt_handle)
+                    self.__delete_message_queue.put_nowait(receipt_handle)
         getLogger().info(f"Stopping receiving messages from {self.__edge.name}")
 
     def join(self) -> None:
@@ -518,16 +516,13 @@ class LambdaNode(Node):
             user_pool_id=user_pool_id,
             username=username,
         )
-        self.start()
-
-    def _get_source(self, queue_arn: str) -> str:
-        return self.__queue_name_to_source[queue_arn.split(":")[-1:][0]]
-
-    def start(self) -> None:
         super().start()
         self.__queue_name_to_source = {
             edge.queue.split("/")[-1:][0]: edge.name for edge in self._sources
         }
+
+    def _get_source(self, queue_arn: str) -> str:
+        return self.__queue_name_to_source[queue_arn.split(":")[-1:][0]]
 
     def handle_event(self, event: LambdaEvent) -> None:
         records: list[

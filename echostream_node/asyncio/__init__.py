@@ -122,9 +122,6 @@ class __BulkDataStorageQueue(asyncio.Queue):
         for bulk_data_storage in bulk_data_storages:
             await self.put(__BulkDataStorage(bulk_data_storage, self.__client_session))
 
-    async def _stop(self) -> None:
-        await self.__client_session.close()
-
     async def get(self) -> __BulkDataStorage:
         if self.qsize() < 20:
             if not self.__filler_task or self.__filler_task.done():
@@ -134,6 +131,9 @@ class __BulkDataStorageQueue(asyncio.Queue):
         bulk_data_storage: __BulkDataStorage = await super().get()
         return await self.get() if bulk_data_storage.expired else bulk_data_storage
 
+    async def stop(self) -> None:
+        await self.__client_session.close()
+
 
 class __BulkDataStorage(BulkDataStorage):
     def __init__(
@@ -142,7 +142,7 @@ class __BulkDataStorage(BulkDataStorage):
         session: ClientSession,
     ) -> None:
         super().__init__(bulk_data_storage)
-        self.__session = session
+        self.__client_session = session
 
     async def handle_bulk_data(self, data: Union[bytearray, bytes, BinaryIO]) -> str:
         if isinstance(data, BinaryIO):
@@ -153,7 +153,7 @@ class __BulkDataStorage(BulkDataStorage):
             buffer.seek(0)
             form_data = FormData(self.presigned_post.fields)
             form_data.add_field("file", buffer, filename="bulk_data")
-            async with self.__session.post(
+            async with self.__client_session.post(
                 self.presigned_post.url, data=form_data
             ) as response:
                 response.raise_for_status()
@@ -318,8 +318,7 @@ class __SourceMessageReceiver:
                         getLogger().exception(
                             f"Error handling recevied message for {self.__edge.name}"
                         )
-                    else:
-                        self.__delete_message_queue.put_nowait(receipt_handle)
+                    self.__delete_message_queue.put_nowait(receipt_handle)
         getLogger().info(f"Stopping receiving messages from {self.__edge.name}")
 
     async def join(self) -> None:
@@ -431,8 +430,8 @@ class Node(BaseNode):
         )
         self.__bulk_data_storage_queue: __BulkDataStorageQueue = None
         self.__audit_records_queue: __AuditRecordQueue = None
-        self.__running = False
         self.__source_message_receivers: list[__SourceMessageReceiver] = list()
+        self.__stop = asyncio.Event()
         self.__target_message_queues: dict[str, __TargetMessageQueue] = dict()
 
     async def handle_bulk_data(self, data: Union[bytearray, bytes]) -> str:
@@ -442,22 +441,16 @@ class Node(BaseNode):
         pass
 
     async def join(self) -> None:
-        for app_node_receiver in self.__source_message_receivers:
-            app_node_receiver.join()
-        for target_message_queue in self.__target_message_queues.values():
-            await target_message_queue.join()
+        await self.__stop.wait()
+        await asyncio.gather(map(__SourceMessageReceiver.join, self.__source_message_receivers))
+        await asyncio.gather(map(__TargetMessageQueue.join, self.__target_message_queues.values()))
         if self.__audit_records_queue:
             await self.__audit_records_queue.join()
-        if not self.__running and self.__bulk_data_storage_queue:
-            await self.__bulk_data_storage_queue._stop()
+        if self.__bulk_data_storage_queue:
+            await self.__bulk_data_storage_queue.stop()
 
     def put_audit_record(self, audit_record: AuditRecord) -> None:
         self.__audit_records_queue.put_nowait(audit_record)
-
-    async def restart(self) -> None:
-        await self.stop()
-        await self.join()
-        await self.start()
 
     async def send_message(
         self, /, message: Message, *, targets: set[str] = None
@@ -474,7 +467,7 @@ class Node(BaseNode):
                     target_message_queue.put_nowait(message)
 
     async def start(self) -> None:
-        self.__running = True
+        self.__stop.clear()
         self.__bulk_data_storage_queue = __BulkDataStorageQueue(self)
         async with self._gql_client as session:
             data: dict[str, dict] = await session.execute(
@@ -515,6 +508,6 @@ class Node(BaseNode):
         ]
 
     async def stop(self) -> None:
-        self.__running = False
         for app_node_receiver in self.__source_message_receivers:
             app_node_receiver.stop()
+        self.__stop.set()
