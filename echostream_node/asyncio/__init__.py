@@ -322,7 +322,7 @@ class __SourceMessageReceiver:
         getLogger().info(f"Stopping receiving messages from {self.__edge.name}")
 
     async def join(self) -> None:
-        await asyncio.wait({self.__task})
+        done, pending = await asyncio.wait({self.__task})
         await self.__delete_message_queue.join()
 
     def stop(self) -> None:
