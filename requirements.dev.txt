@@ -1,5 +1,6 @@
 aiohttp[speedups]
 aws-lambda-context
+awsserviceendpoints
 black
 boto3
 boto3-stubs[sqs]

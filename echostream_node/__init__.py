@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from os import cpu_count, environ
 from typing import TYPE_CHECKING, Any, Callable, Union
 
+import awsserviceendpoints
 import simplejson as json
 from boto3.session import Session
 from botocore.config import Config
