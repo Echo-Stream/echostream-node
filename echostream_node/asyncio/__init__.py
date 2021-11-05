@@ -18,12 +18,12 @@ from .. import (
     _GET_BULK_DATA_STORAGE_GQL,
     _GET_NODE_GQL,
     AuditRecord,
-    BulkDataStorage,
+    BulkDataStorage as BaseBulkDataStorage,
     Edge,
     Message,
+    Node as BaseNode,
+    PresignedPost, getLogger
 )
-from .. import Node as BaseNode
-from .. import PresignedPost, getLogger
 
 if TYPE_CHECKING:
     from mypy_boto3_sqs.type_defs import (
@@ -35,14 +35,14 @@ else:
     SendMessageBatchRequestEntryTypeDef = dict
 
 
-class __AuditRecordQueue(asyncio.Queue):
+class _AuditRecordQueue(asyncio.Queue):
     def __init__(self, message_type: str, node: Node) -> None:
         super().__init__()
         self.__message_type = message_type
         self.__node = node
         self.__task: asyncio.Task = None
 
-    async def __batcher(
+    async def _batcher(
         self,
     ) -> AsyncGenerator[list[AuditRecord], None,]:
         batch: list[AuditRecord] = list()
@@ -60,8 +60,8 @@ class __AuditRecordQueue(asyncio.Queue):
         if batch:
             yield batch
 
-    async def __sender(self) -> None:
-        async for batch in self.__batcher():
+    async def _sender(self) -> None:
+        async for batch in self._batcher():
             try:
                 async with self.__node._gql_client as session:
                     await session.execute(
@@ -98,7 +98,7 @@ class __AuditRecordQueue(asyncio.Queue):
     def _put(self, item: Any) -> None:
         if self.empty() and (not self.__task or self.__task.done()):
             self.__task = asyncio.create_task(
-                self.__sender(), name=f"AuditRecordsSender"
+                self._sender(), name=f"AuditRecordsSender"
             )
         return super()._put(item)
 
@@ -106,7 +106,7 @@ class __AuditRecordQueue(asyncio.Queue):
         return await super().get()
 
 
-class __BulkDataStorageQueue(asyncio.Queue):
+class _BulkDataStorageQueue(asyncio.Queue):
     def __init__(self, node: Node) -> None:
         super().__init__()
         self.__client_session = ClientSession()
@@ -120,22 +120,22 @@ class __BulkDataStorageQueue(asyncio.Queue):
                 variable_values={"tenant", self.__node.tenant},
             )
         for bulk_data_storage in bulk_data_storages:
-            await self.put(__BulkDataStorage(bulk_data_storage, self.__client_session))
+            await self.put(BulkDataStorage(bulk_data_storage, self.__client_session))
 
-    async def get(self) -> __BulkDataStorage:
+    async def get(self) -> BulkDataStorage:
         if self.qsize() < 20:
             if not self.__filler_task or self.__filler_task.done():
                 self.__filler_task = asyncio.create_task(
                     self.__filler(), name="BulkDataStorageQueueFiller"
                 )
-        bulk_data_storage: __BulkDataStorage = await super().get()
+        bulk_data_storage: BulkDataStorage = await super().get()
         return await self.get() if bulk_data_storage.expired else bulk_data_storage
 
     async def stop(self) -> None:
         await self.__client_session.close()
 
 
-class __BulkDataStorage(BulkDataStorage):
+class BulkDataStorage(BaseBulkDataStorage):
     def __init__(
         self,
         bulk_data_storage: dict[str, Union[str, PresignedPost]],
@@ -160,7 +160,7 @@ class __BulkDataStorage(BulkDataStorage):
         return self.presigned_get
 
 
-class __DeleteMessageQueue(asyncio.Queue):
+class _DeleteMessageQueue(asyncio.Queue):
     def __init__(self, edge: Edge, node: Node) -> None:
         super().__init__()
         self.__edge = edge
@@ -226,23 +226,11 @@ class __DeleteMessageQueue(asyncio.Queue):
         return await super().get()
 
 
-class __DynamicAuthAIOHTTPTransport(AIOHTTPTransport):
-    def __init__(self, cognito: Cognito, url: str, **kwargs: Any) -> None:
-        self._cognito = cognito
-        super().__init__(url, **kwargs)
-
-    def __getattribute__(self, name: str) -> Any:
-        if name == "headers":
-            self._cognito.check_token()
-            return dict(Authorization=self._cognito.access_token)
-        return super().__getattribute__(name)
-
-
-class __SourceMessageReceiver:
+class _SourceMessageReceiver:
     def __init__(self, edge: Edge, node: Node) -> None:
         self.__continue = asyncio.Event()
         self.__continue.set()
-        self.__delete_message_queue = __DeleteMessageQueue(edge, node)
+        self.__delete_message_queue = _DeleteMessageQueue(edge, node)
         self.__node = node
         self.__edge = edge
         self.__task: asyncio.Task = asyncio.create_task(self.__receive())
@@ -329,7 +317,7 @@ class __SourceMessageReceiver:
         self.__continue.clear()
 
 
-class __TargetMessageQueue(asyncio.Queue):
+class _TargetMessageQueue(asyncio.Queue):
     def __init__(self, node: Node, edge: Edge) -> None:
         self.__node = node
         self.__edge = edge
@@ -406,6 +394,18 @@ class __TargetMessageQueue(asyncio.Queue):
         return await super().get()
 
 
+class CognitoAIOHTTPTransport(AIOHTTPTransport):
+    def __init__(self, cognito: Cognito, url: str, **kwargs: Any) -> None:
+        self._cognito = cognito
+        super().__init__(url, **kwargs)
+
+    def __getattribute__(self, name: str) -> Any:
+        if name == "headers":
+            self._cognito.check_token()
+            return dict(Authorization=self._cognito.access_token)
+        return super().__getattribute__(name)
+
+
 class Node(BaseNode):
     def __init__(
         self,
@@ -419,7 +419,7 @@ class Node(BaseNode):
         username: str = None,
     ) -> None:
         super().__init__(
-            gql_transport_cls=__DynamicAuthAIOHTTPTransport,
+            gql_transport_cls=CognitoAIOHTTPTransport,
             appsync_endpoint=appsync_endpoint,
             client_id=client_id,
             name=name,
@@ -428,11 +428,11 @@ class Node(BaseNode):
             user_pool_id=user_pool_id,
             username=username,
         )
-        self.__bulk_data_storage_queue: __BulkDataStorageQueue = None
-        self.__audit_records_queue: __AuditRecordQueue = None
-        self.__source_message_receivers: list[__SourceMessageReceiver] = list()
+        self.__bulk_data_storage_queue: _BulkDataStorageQueue = None
+        self.__audit_records_queue: _AuditRecordQueue = None
+        self.__source_message_receivers: list[_SourceMessageReceiver] = list()
         self.__stop = asyncio.Event()
-        self.__target_message_queues: dict[str, __TargetMessageQueue] = dict()
+        self.__target_message_queues: dict[str, _TargetMessageQueue] = dict()
 
     async def handle_bulk_data(self, data: Union[bytearray, bytes]) -> str:
         return await (await self.__bulk_data_storage_queue.get()).handle_bulk_data(data)
@@ -442,8 +442,8 @@ class Node(BaseNode):
 
     async def join(self) -> None:
         await self.__stop.wait()
-        await asyncio.gather(map(__SourceMessageReceiver.join, self.__source_message_receivers))
-        await asyncio.gather(map(__TargetMessageQueue.join, self.__target_message_queues.values()))
+        await asyncio.gather(*list(map(_SourceMessageReceiver.join, self.__source_message_receivers)))
+        await asyncio.gather(*list(map(_TargetMessageQueue.join, self.__target_message_queues.values())))
         if self.__audit_records_queue:
             await self.__audit_records_queue.join()
         if self.__bulk_data_storage_queue:
@@ -468,7 +468,7 @@ class Node(BaseNode):
 
     async def start(self) -> None:
         self.__stop.clear()
-        self.__bulk_data_storage_queue = __BulkDataStorageQueue(self)
+        self.__bulk_data_storage_queue = _BulkDataStorageQueue(self)
         async with self._gql_client as session:
             data: dict[str, dict] = await session.execute(
                 _GET_NODE_GQL,
@@ -497,17 +497,17 @@ class Node(BaseNode):
             Edge(name=edge["target"]["name"], queue=edge["queue"])
             for edge in data["sendEdges"]
         }
-        self.__audit_records_queue = __AuditRecordQueue(
+        self.__audit_records_queue = _AuditRecordQueue(
             self._receive_message_type, self
         )
         self.__target_message_queues = {
-            edge.name: __TargetMessageQueue(self, edge) for edge in self._targets
+            edge.name: _TargetMessageQueue(self, edge) for edge in self._targets
         }
         self.__source_message_receivers = [
-            __SourceMessageReceiver(edge, self) for edge in self._sources
+            _SourceMessageReceiver(edge, self) for edge in self._sources
         ]
 
     async def stop(self) -> None:
-        for app_node_receiver in self.__source_message_receivers:
-            app_node_receiver.stop()
+        for source_message_receiver in self.__source_message_receivers:
+            source_message_receiver.stop()
         self.__stop.set()

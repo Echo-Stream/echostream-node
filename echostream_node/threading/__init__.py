@@ -19,14 +19,14 @@ from .. import (
     _CREATE_AUDIT_RECORDS,
     _GET_BULK_DATA_STORAGE_GQL,
     _GET_NODE_GQL,
+    getLogger,
     AuditRecord,
-    BulkDataStorage,
+    BulkDataStorage as BaseBulkDataStorage,
     Edge,
     LambdaEvent,
     Message,
+    Node as BaseNode,
 )
-from .. import Node as BaseNode
-from .. import getLogger
 
 if TYPE_CHECKING:
     from mypy_boto3_sqs.type_defs import (
@@ -38,7 +38,7 @@ else:
     SendMessageBatchRequestEntryTypeDef = dict
 
 
-class __AuditRecordQueue(Queue):
+class _AuditRecordQueue(Queue):
     def __init__(self, message_type: str, node: Node) -> None:
         super().__init__()
         self.__continue = Event()
@@ -93,7 +93,7 @@ class __AuditRecordQueue(Queue):
         self.__continue.clear()
 
 
-class __BulkDataStorage(BulkDataStorage):
+class _BulkDataStorage(BaseBulkDataStorage):
     def handle_bulk_data(self, data: Union[bytearray, bytes, BinaryIO]) -> str:
         if isinstance(data, BinaryIO):
             data = data.read()
@@ -109,7 +109,7 @@ class __BulkDataStorage(BulkDataStorage):
         return self.presigned_get
 
 
-class __BulkDataStorageQueue(Queue):
+class _BulkDataStorageQueue(Queue):
     def __init__(self, node: Node) -> None:
         super().__init__()
         self.fill = Condition()
@@ -124,15 +124,15 @@ class __BulkDataStorageQueue(Queue):
                     variable_values={"tenant", node.tenant},
                 )
                 for bulk_data_storage in bulk_data_storages:
-                    self.put(__BulkDataStorage(bulk_data_storage))
+                    self.put(_BulkDataStorage(bulk_data_storage))
 
         Thread(daemon=True, name="BulkDataStorageQueueFiller", target=filler).start()
 
-    def get(self, block: bool = True, timeout: float = None) -> __BulkDataStorage:
+    def get(self, block: bool = True, timeout: float = None) -> _BulkDataStorage:
         with self.fill:
             if self.qsize() < 20:
                 self.fill.notify()
-        bulk_data_storage: __BulkDataStorage = super().get(block=block, timeout=timeout)
+        bulk_data_storage: _BulkDataStorage = super().get(block=block, timeout=timeout)
         return (
             self.get(block=block, timeout=timeout)
             if bulk_data_storage.expired
@@ -140,19 +140,7 @@ class __BulkDataStorageQueue(Queue):
         )
 
 
-class __DynamicAuthRequestsHTTPTransport(RequestsHTTPTransport):
-    def __init__(self, cognito: Cognito, url: str, **kwargs: Any) -> None:
-        self._cognito = cognito
-        super().__init__(url, **kwargs)
-
-    def __getattribute__(self, name: str) -> Any:
-        if name == "headers":
-            self._cognito.check_token()
-            return dict(Authorization=self._cognito.access_token)
-        return super().__getattribute__(name)
-
-
-class __TargetMessageQueue(Queue):
+class _TargetMessageQueue(Queue):
     def __init__(self, node: Node, edge: Edge) -> None:
         super().__init__()
         self.__continue = Event()
@@ -223,6 +211,18 @@ class __TargetMessageQueue(Queue):
         self.__continue.clear()
 
 
+class CognitoRequestsHTTPTransport(RequestsHTTPTransport):
+    def __init__(self, cognito: Cognito, url: str, **kwargs: Any) -> None:
+        self._cognito = cognito
+        super().__init__(url, **kwargs)
+
+    def __getattribute__(self, name: str) -> Any:
+        if name == "headers":
+            self._cognito.check_token()
+            return dict(Authorization=self._cognito.access_token)
+        return super().__getattribute__(name)
+
+
 class Node(BaseNode):
     def __init__(
         self,
@@ -236,7 +236,7 @@ class Node(BaseNode):
         username: str = None,
     ) -> None:
         super().__init__(
-            gql_transport_cls=__DynamicAuthRequestsHTTPTransport,
+            gql_transport_cls=CognitoRequestsHTTPTransport,
             appsync_endpoint=appsync_endpoint,
             client_id=client_id,
             name=name,
@@ -245,10 +245,10 @@ class Node(BaseNode):
             user_pool_id=user_pool_id,
             username=username,
         )
-        self.__bulk_data_storage_queue = __BulkDataStorageQueue(self)
-        self.__audit_records_queue: __AuditRecordQueue = None
+        self.__bulk_data_storage_queue = _BulkDataStorageQueue(self)
+        self.__audit_records_queue: _AuditRecordQueue = None
         self.__stop = Event()
-        self.__target_message_queues: dict[str, __TargetMessageQueue] = dict()
+        self.__target_message_queues: dict[str, _TargetMessageQueue] = dict()
 
     def handle_bulk_data(self, data: Union[bytearray, bytes]) -> str:
         return self.__bulk_data_storage_queue.get().handle_bulk_data(data)
@@ -307,11 +307,11 @@ class Node(BaseNode):
             Edge(name=edge["target"]["name"], queue=edge["queue"])
             for edge in data["sendEdges"]
         }
-        self.__audit_records_queue = __AuditRecordQueue(
+        self.__audit_records_queue = _AuditRecordQueue(
             self._receive_message_type, self
         )
         self.__target_message_queues = {
-            edge.name: __TargetMessageQueue(self, edge) for edge in self._targets
+            edge.name: _TargetMessageQueue(self, edge) for edge in self._targets
         }
 
     def stop(self) -> None:
@@ -321,7 +321,7 @@ class Node(BaseNode):
         self.__stop.set()
 
 
-class __DeleteMessageQueue(Queue):
+class _DeleteMessageQueue(Queue):
     def __init__(self, edge: Edge, node: Node) -> None:
         super().__init__()
         self.__continue = Event()
@@ -369,14 +369,14 @@ class __DeleteMessageQueue(Queue):
         self.__continue.clear()
 
 
-class __SourceMessageReceiver(Thread):
+class _SourceMessageReceiver(Thread):
     def __init__(self, edge: Edge, node: Node) -> None:
         super().__init__(
             daemon=True, name=f"AppNodeReceiver({edge.name})", target=self.__receive
         )
         self.__continue = Event()
         self.__continue.set()
-        self.__delete_message_queue = __DeleteMessageQueue(edge, node)
+        self.__delete_message_queue = _DeleteMessageQueue(edge, node)
         self.__node = node
         self.__edge = edge
         self.start()
@@ -476,7 +476,7 @@ class AppNode(Node):
             user_pool_id=user_pool_id,
             username=username,
         )
-        self.__source_message_receivers: list[__SourceMessageReceiver] = list()
+        self.__source_message_receivers: list[_SourceMessageReceiver] = list()
 
     def join(self) -> None:
         for app_node_receiver in self.__source_message_receivers:
@@ -486,7 +486,7 @@ class AppNode(Node):
     def start(self) -> None:
         super().start()
         self.__source_message_receivers = [
-            __SourceMessageReceiver(edge, self) for edge in self._sources
+            _SourceMessageReceiver(edge, self) for edge in self._sources
         ]
 
     def stop(self) -> None:

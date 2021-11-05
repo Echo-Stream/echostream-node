@@ -175,7 +175,7 @@ _GET_NODE_GQL = gql(
 )
 
 
-class __NodeSession(BotocoreSession):
+class _NodeSession(BotocoreSession):
     def __init__(self, node: Node, duration: int = 900) -> None:
         super().__init__()
 
@@ -358,7 +358,7 @@ class Node(ABC):
         if self.__node_type == "ExternalNode" and self.__app_type == "CrossAccountApp":
             session = Session()
         else:
-            session = Session(botocore_session=__NodeSession(self))
+            session = Session(botocore_session=_NodeSession(self))
         self.__sqs_client: SQSClient = session.client(
             "sqs",
             Config(
