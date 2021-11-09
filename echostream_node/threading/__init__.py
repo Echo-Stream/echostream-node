@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, BinaryIO, Generator, Union
 from uuid import uuid4
 
 import dynamic_function_loader
-from botocore.exceptions import ClientError
+from aws_error_utils import catch_aws_error
 from gql.transport.requests import RequestsHTTPTransport
 from pycognito import Cognito
 from requests import post
@@ -387,22 +387,16 @@ class _SourceMessageReceiver(Thread):
                         WaitTimeSeconds=20,
                     )
                     error_count = 0
-                except Exception as e:
-                    if (
-                        isinstance(e, ClientError)
-                        and e.response["Error"]["Code"]
-                        == "AWS.SimpleQueueService.NonExistentQueue"
-                    ):
-                        getLogger().warning(
-                            f"Queue {edge.queue} does not exist, exiting"
-                        )
-                        break
+                except catch_aws_error("AWS.SimpleQueueService.NonExistentQueue"):
+                    getLogger().warning(f"Queue {edge.queue} does not exist, exiting")
+                    break
+                except Exception:
                     error_count += 1
                     if error_count == 10:
                         getLogger().critical(
                             f"Recevied 10 errors in a row trying to receive from {edge.queue}, exiting"
                         )
-                        raise e
+                        raise
                     else:
                         getLogger().exception(
                             f"Error receiving messages from {edge.name}, retrying"

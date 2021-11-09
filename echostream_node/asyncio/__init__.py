@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator, BinaryIO, Union
 import dynamic_function_loader
 import simplejson as json
 from aiohttp import ClientSession, FormData
-from botocore.exceptions import ClientError
+from aws_error_utils import catch_aws_error
 from gql.transport.aiohttp import AIOHTTPTransport
 from pycognito import Cognito
 
@@ -246,22 +246,16 @@ class _SourceMessageReceiver:
                     error_count = 0
                 except asyncio.CancelledError:
                     raise
-                except Exception as e:
-                    if (
-                        isinstance(e, ClientError)
-                        and e.response["Error"]["Code"]
-                        == "AWS.SimpleQueueService.NonExistentQueue"
-                    ):
-                        getLogger().warning(
-                            f"Queue {edge.queue} does not exist, exiting"
-                        )
-                        break
+                except catch_aws_error("AWS.SimpleQueueService.NonExistentQueue"):
+                    getLogger().warning(f"Queue {edge.queue} does not exist, exiting")
+                    break
+                except Exception:
                     error_count += 1
                     if error_count == 10:
                         getLogger().critical(
                             f"Recevied 10 errors in a row trying to receive from {edge.queue}, exiting"
                         )
-                        raise e
+                        raise
                     else:
                         getLogger().exception(
                             f"Error receiving messages from {edge.name}, retrying"
@@ -297,9 +291,7 @@ class _SourceMessageReceiver:
                         self.__delete_message_queue.put_nowait(receipt_handle)
             getLogger().info(f"Stopping receiving messages from {edge.name}")
 
-        self.__task: asyncio.Task = asyncio.create_task(
-            receive(), name=f"SourceMessageReceiver({edge.name})"
-        )
+        asyncio.create_task(receive(), name=f"SourceMessageReceiver({edge.name})")
 
     async def join(self) -> None:
         done, pending = await asyncio.wait([self.__task])
