@@ -93,7 +93,13 @@ _GET_APP_GQL = gql(
             __typename
             ... on ExternalNode {
                 app {
-                    name
+                    __typename
+                    ... on ExternalApp {
+                        name
+                    }
+                    ... on CrossAccountApp {
+                        name
+                    }
                 }
             }
             ... on ManagedNode {
