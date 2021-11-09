@@ -307,9 +307,7 @@ class Node(BaseNode):
             Edge(name=edge["target"]["name"], queue=edge["queue"])
             for edge in data["sendEdges"]
         }
-        self.__audit_records_queue = _AuditRecordQueue(
-            self._receive_message_type, self
-        )
+        self.__audit_records_queue = _AuditRecordQueue(self._receive_message_type, self)
         self.__target_message_queues = {
             edge.name: _TargetMessageQueue(self, edge) for edge in self._targets
         }
@@ -371,80 +369,77 @@ class _DeleteMessageQueue(Queue):
 
 class _SourceMessageReceiver(Thread):
     def __init__(self, edge: Edge, node: Node) -> None:
-        super().__init__(
-            daemon=True, name=f"AppNodeReceiver({edge.name})", target=self.__receive
-        )
         self.__continue = Event()
         self.__continue.set()
         self.__delete_message_queue = _DeleteMessageQueue(edge, node)
-        self.__node = node
-        self.__edge = edge
-        self.start()
 
-    def __receive(self) -> None:
-        self.__continue.wait()
-        getLogger().info(f"Receiving messages from {self.__edge.name}")
-        error_count = 0
-        while self.__continue.is_set():
-            try:
-                response = self.__node._sqs_client.receive_message(
-                    AttributeNames=["All"],
-                    MaxNumberOfMessages=10,
-                    MessageAttributeNames=["All"],
-                    QueueUrl=self.__edge.queue,
-                    WaitTimeSeconds=20,
-                )
-                error_count = 0
-            except Exception as e:
-                if (
-                    isinstance(e, ClientError)
-                    and e.response["Error"]["Code"]
-                    == "AWS.SimpleQueueService.NonExistentQueue"
-                ):
-                    getLogger().warning(
-                        f"Queue {self.__edge.queue} does not exist, exiting"
+        def receive() -> None:
+            self.__continue.wait()
+            getLogger().info(f"Receiving messages from {edge.name}")
+            error_count = 0
+            while self.__continue.is_set():
+                try:
+                    response = node._sqs_client.receive_message(
+                        AttributeNames=["All"],
+                        MaxNumberOfMessages=10,
+                        MessageAttributeNames=["All"],
+                        QueueUrl=edge.queue,
+                        WaitTimeSeconds=20,
                     )
-                    break
-                error_count += 1
-                if error_count == 10:
-                    getLogger().critical(
-                        f"Recevied 10 errors in a row trying to receive from {self.__edge.queue}, exiting"
-                    )
-                    raise e
-                else:
-                    getLogger().exception(
-                        f"Error receiving messages from {self.__edge.name}, retrying"
-                    )
-                    sleep(10)
-            else:
-                sqs_messages = response["Messages"]
-                if not (self.__continue.is_set() and sqs_messages):
-                    continue
-                getLogger().info(
-                    f"Received {len(sqs_messages)} from {self.__edge.name}"
-                )
-                for sqs_message in sqs_messages:
-                    message = Message(
-                        body=sqs_message["Body"],
-                        group_id=sqs_message["Attributes"]["MessageGroupId"],
-                        tracking_id=sqs_message["MessageAttributes"]
-                        .get("trackingId", {})
-                        .get("StringValue"),
-                        previous_tracking_ids=sqs_message["MessageAttributes"]
-                        .get("prevTrackingIds", {})
-                        .get("StringValue"),
-                    )
-                    receipt_handle = sqs_message["ReceiptHandle"]
-                    try:
-                        self.__node.handle_received_message(
-                            message=message, source=self.__edge.name
+                    error_count = 0
+                except Exception as e:
+                    if (
+                        isinstance(e, ClientError)
+                        and e.response["Error"]["Code"]
+                        == "AWS.SimpleQueueService.NonExistentQueue"
+                    ):
+                        getLogger().warning(
+                            f"Queue {edge.queue} does not exist, exiting"
                         )
-                    except Exception:
+                        break
+                    error_count += 1
+                    if error_count == 10:
+                        getLogger().critical(
+                            f"Recevied 10 errors in a row trying to receive from {edge.queue}, exiting"
+                        )
+                        raise e
+                    else:
                         getLogger().exception(
-                            f"Error handling recevied message for {self.__edge.name}"
+                            f"Error receiving messages from {edge.name}, retrying"
                         )
-                    self.__delete_message_queue.put_nowait(receipt_handle)
-        getLogger().info(f"Stopping receiving messages from {self.__edge.name}")
+                        sleep(10)
+                else:
+                    sqs_messages = response["Messages"]
+                    if not (self.__continue.is_set() and sqs_messages):
+                        continue
+                    getLogger().info(f"Received {len(sqs_messages)} from {edge.name}")
+                    for sqs_message in sqs_messages:
+                        message = Message(
+                            body=sqs_message["Body"],
+                            group_id=sqs_message["Attributes"]["MessageGroupId"],
+                            tracking_id=sqs_message["MessageAttributes"]
+                            .get("trackingId", {})
+                            .get("StringValue"),
+                            previous_tracking_ids=sqs_message["MessageAttributes"]
+                            .get("prevTrackingIds", {})
+                            .get("StringValue"),
+                        )
+                        receipt_handle = sqs_message["ReceiptHandle"]
+                        try:
+                            node.handle_received_message(
+                                message=message, source=edge.name
+                            )
+                        except Exception:
+                            getLogger().exception(
+                                f"Error handling recevied message for {edge.name}"
+                            )
+                        self.__delete_message_queue.put_nowait(receipt_handle)
+            getLogger().info(f"Stopping receiving messages from {edge.name}")
+
+        super().__init__(
+            daemon=True, name=f"SourceMessageReceiver({edge.name})", target=receive
+        )
+        self.start()
 
     def join(self) -> None:
         super().join()
