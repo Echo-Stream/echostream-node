@@ -22,7 +22,8 @@ from .. import (
     Edge,
     Message,
     Node as BaseNode,
-    PresignedPost, getLogger
+    PresignedPost,
+    getLogger,
 )
 
 if TYPE_CHECKING:
@@ -42,65 +43,65 @@ class _AuditRecordQueue(asyncio.Queue):
         self.__node = node
         self.__task: asyncio.Task = None
 
-    async def _batcher(
-        self,
-    ) -> AsyncGenerator[list[AuditRecord], None,]:
-        batch: list[AuditRecord] = list()
-        while not self.empty():
-            try:
-                batch.append(await asyncio.wait_for(self.get(), timeout=0.1))
-            except asyncio.TimeoutError:
+    def _put(self, item: Any) -> None:
+        async def sender() -> None:
+            async def batcher() -> AsyncGenerator[
+                list[AuditRecord],
+                None,
+            ]:
+                batch: list[AuditRecord] = list()
+                while not self.empty():
+                    try:
+                        batch.append(await asyncio.wait_for(self.get(), timeout=0.1))
+                    except asyncio.TimeoutError:
+                        if batch:
+                            yield batch
+                            batch = list()
+                    else:
+                        if len(batch) == 500:
+                            yield batch
+                            batch = list()
                 if batch:
                     yield batch
-                    batch = list()
-            else:
-                if len(batch) == 500:
-                    yield batch
-                    batch = list()
-        if batch:
-            yield batch
 
-    async def _sender(self) -> None:
-        async for batch in self._batcher():
-            try:
-                async with self.__node._gql_client as session:
-                    await session.execute(
-                        _CREATE_AUDIT_RECORDS,
-                        variable_values=dict(
-                            name=self.__node.name,
-                            tenant=self.__node.tenant,
-                            messageType=self.__message_type,
-                            auditRecords=[
-                                dict(
-                                    attributes=json.dumps(
-                                        audit_record.attributes,
-                                        separators=(",", ":"),
-                                    ),
-                                    datetime=audit_record.date_time.isoformat(),
-                                    previousTrackingIds=list(
-                                        audit_record.previous_tracking_ids
-                                    ),
-                                    sourceNode=audit_record.source_node,
-                                    trackingId=audit_record.tracking_id,
-                                )
-                                for audit_record in batch
-                            ],
-                        ),
-                    )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                getLogger().exception("Error creating audit records")
-            finally:
-                for _ in range(len(batch)):
-                    self.task_done()
+            async for batch in batcher():
+                try:
+                    async with self.__node._gql_client as session:
+                        await session.execute(
+                            _CREATE_AUDIT_RECORDS,
+                            variable_values=dict(
+                                name=self.__node.name,
+                                tenant=self.__node.tenant,
+                                messageType=self.__message_type,
+                                auditRecords=[
+                                    dict(
+                                        attributes=json.dumps(
+                                            audit_record.attributes,
+                                            separators=(",", ":"),
+                                        ),
+                                        datetime=audit_record.date_time.isoformat(),
+                                        previousTrackingIds=list(
+                                            audit_record.previous_tracking_ids
+                                        ),
+                                        sourceNode=audit_record.source_node,
+                                        trackingId=audit_record.tracking_id,
+                                    )
+                                    for audit_record in batch
+                                ],
+                            ),
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    getLogger().exception("Error creating audit records")
+                finally:
+                    for _ in range(len(batch)):
+                        self.task_done()
 
-    def _put(self, item: Any) -> None:
-        if self.empty() and (not self.__task or self.__task.done()):
-            self.__task = asyncio.create_task(
-                self._sender(), name=f"AuditRecordsSender"
-            )
-        return super()._put(item)
+        empty = self.empty()
+        super()._put(item)
+        if empty and (not self.__task or self.__task.done()):
+            self.__task = asyncio.create_task(sender(), name=f"AuditRecordsSender")
 
     async def get(self) -> AuditRecord:
         return await super().get()
@@ -111,23 +112,27 @@ class _BulkDataStorageQueue(asyncio.Queue):
         super().__init__()
         self.__client_session = ClientSession()
         self.__node = node
-        self.__filler_task: asyncio.Task = None
+        self.__task: asyncio.Task = None
 
-    async def __filler(self) -> None:
-        async with self.__node._gql_client as session:
-            bulk_data_storages = await session.execute(
-                _GET_BULK_DATA_STORAGE_GQL,
-                variable_values={"tenant", self.__node.tenant},
+    def _get(self) -> BulkDataStorage:
+        async def filler() -> None:
+            async with self.__node._gql_client as session:
+                bulk_data_storages = await session.execute(
+                    _GET_BULK_DATA_STORAGE_GQL,
+                    variable_values={"tenant", self.__node.tenant},
+                )
+            for bulk_data_storage in bulk_data_storages:
+                await self.put(
+                    BulkDataStorage(bulk_data_storage, self.__client_session)
+                )
+
+        if self.qsize() < 20 and (not self.__task or self.__task.done()):
+            self.__task = asyncio.create_task(
+                filler(), name="BulkDataStorageQueueFiller"
             )
-        for bulk_data_storage in bulk_data_storages:
-            await self.put(BulkDataStorage(bulk_data_storage, self.__client_session))
+        return super()._get()
 
     async def get(self) -> BulkDataStorage:
-        if self.qsize() < 20:
-            if not self.__filler_task or self.__filler_task.done():
-                self.__filler_task = asyncio.create_task(
-                    self.__filler(), name="BulkDataStorageQueueFiller"
-                )
         bulk_data_storage: BulkDataStorage = await super().get()
         return await self.get() if bulk_data_storage.expired else bulk_data_storage
 
@@ -167,60 +172,64 @@ class _DeleteMessageQueue(asyncio.Queue):
         self.__node = node
         self.__task: asyncio.Task = None
 
-    async def __batcher(
-        self,
-    ) -> AsyncGenerator[list[str], None,]:
-        batch: list[str] = list()
-        while not self.empty():
-            try:
-                batch.append(await asyncio.wait_for(self.get(), timeout=0.1))
-            except asyncio.TimeoutError:
-                if batch:
-                    yield batch
-                    batch = list()
-            else:
-                if len(batch) == 10:
-                    yield batch
-                    batch = list()
-        if batch:
-            yield batch
-
-    async def __deleter(self) -> None:
-        loop = asyncio.get_running_loop()
-        async for receipt_handles in self.__batcher():
-            try:
-                response = await loop.run_in_executor(
-                    None,
-                    partial(
-                        self.__node._sqs_client.delete_message_batch,
-                        Entries=[
-                            DeleteMessageBatchRequestEntryTypeDef(
-                                Id=str(id), ReceiptHandle=receipt_handle
-                            )
-                            for id, receipt_handle in enumerate(receipt_handles)
-                        ],
-                        QueueUrl=self.__edge.queue,
-                    ),
-                )
-                for failed in response["Failed"]:
-                    id = failed.pop("Id")
-                    getLogger().error(
-                        f"Unable to send message {receipt_handles[id]} to {self.__edge.name}, reason {failed}"
-                    )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                getLogger().exception(f"Error sending messages to {self.__edge.name}")
-            finally:
-                for _ in range(len(receipt_handles)):
-                    self.task_done()
-
     def _put(self, item: Any) -> None:
-        if self.empty() and (not self.__task or self.__task.done()):
+        async def batcher() -> AsyncGenerator[
+            list[str],
+            None,
+        ]:
+            batch: list[str] = list()
+            while not self.empty():
+                try:
+                    batch.append(await asyncio.wait_for(self.get(), timeout=0.1))
+                except asyncio.TimeoutError:
+                    if batch:
+                        yield batch
+                        batch = list()
+                else:
+                    if len(batch) == 10:
+                        yield batch
+                        batch = list()
+            if batch:
+                yield batch
+
+        async def deleter() -> None:
+            loop = asyncio.get_running_loop()
+            async for receipt_handles in batcher():
+                try:
+                    response = await loop.run_in_executor(
+                        None,
+                        partial(
+                            self.__node._sqs_client.delete_message_batch,
+                            Entries=[
+                                DeleteMessageBatchRequestEntryTypeDef(
+                                    Id=str(id), ReceiptHandle=receipt_handle
+                                )
+                                for id, receipt_handle in enumerate(receipt_handles)
+                            ],
+                            QueueUrl=self.__edge.queue,
+                        ),
+                    )
+                    for failed in response["Failed"]:
+                        id = failed.pop("Id")
+                        getLogger().error(
+                            f"Unable to send message {receipt_handles[id]} to {self.__edge.name}, reason {failed}"
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    getLogger().exception(
+                        f"Error sending messages to {self.__edge.name}"
+                    )
+                finally:
+                    for _ in range(len(receipt_handles)):
+                        self.task_done()
+
+        empty = self.empty()
+        super()._put(item)
+        if empty and (not self.__task or self.__task.done()):
             self.__task = asyncio.create_task(
-                self.__deleter(), name=f"SourceMessageDeleter({self.__edge.name})"
+                deleter(), name=f"SourceMessageDeleter({self.__edge.name})"
             )
-        return super()._put(item)
 
     async def get(self) -> str:
         return await super().get()
@@ -231,86 +240,85 @@ class _SourceMessageReceiver:
         self.__continue = asyncio.Event()
         self.__continue.set()
         self.__delete_message_queue = _DeleteMessageQueue(edge, node)
-        self.__node = node
-        self.__edge = edge
-        self.__task: asyncio.Task = asyncio.create_task(self.__receive())
 
-    async def __receive(self) -> None:
-        await self.__continue.wait()
-        loop = asyncio.get_running_loop()
-        getLogger().info(f"Receiving messages from {self.__edge.name}")
-        error_count = 0
-        while self.__continue.is_set():
-            try:
-                response = await loop.run_in_executor(
-                    None,
-                    partial(
-                        self.__node._sqs_client.receive_message,
-                        AttributeNames=["All"],
-                        MaxNumberOfMessages=10,
-                        MessageAttributeNames=["All"],
-                        QueueUrl=self.__edge.queue,
-                        WaitTimeSeconds=20,
-                    ),
-                )
-                error_count = 0
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                if (
-                    isinstance(e, ClientError)
-                    and e.response["Error"]["Code"]
-                    == "AWS.SimpleQueueService.NonExistentQueue"
-                ):
-                    getLogger().warning(
-                        f"Queue {self.__edge.queue} does not exist, exiting"
+        async def receive() -> None:
+            await self.__continue.wait()
+            loop = asyncio.get_running_loop()
+            getLogger().info(f"Receiving messages from {edge.name}")
+            error_count = 0
+            while self.__continue.is_set():
+                try:
+                    response = await loop.run_in_executor(
+                        None,
+                        partial(
+                            node._sqs_client.receive_message,
+                            AttributeNames=["All"],
+                            MaxNumberOfMessages=10,
+                            MessageAttributeNames=["All"],
+                            QueueUrl=edge.queue,
+                            WaitTimeSeconds=20,
+                        ),
                     )
-                    break
-                error_count += 1
-                if error_count == 10:
-                    getLogger().critical(
-                        f"Recevied 10 errors in a row trying to receive from {self.__edge.queue}, exiting"
-                    )
-                    raise e
-                else:
-                    getLogger().exception(
-                        f"Error receiving messages from {self.__edge.name}, retrying"
-                    )
-                    await asyncio.sleep(10)
-            else:
-                sqs_messages = response["Messages"]
-                if not (self.__continue.is_set() and sqs_messages):
-                    continue
-                getLogger().info(
-                    f"Received {len(sqs_messages)} from {self.__edge.name}"
-                )
-                for sqs_message in sqs_messages:
-                    message = Message(
-                        body=sqs_message["Body"],
-                        group_id=sqs_message["Attributes"]["MessageGroupId"],
-                        tracking_id=sqs_message["MessageAttributes"]
-                        .get("trackingId", {})
-                        .get("StringValue"),
-                        previous_tracking_ids=sqs_message["MessageAttributes"]
-                        .get("prevTrackingIds", {})
-                        .get("StringValue"),
-                    )
-                    receipt_handle = sqs_message["ReceiptHandle"]
-                    try:
-                        await self.__node.handle_received_message(
-                            message=message, source=self.__edge.name
+                    error_count = 0
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    if (
+                        isinstance(e, ClientError)
+                        and e.response["Error"]["Code"]
+                        == "AWS.SimpleQueueService.NonExistentQueue"
+                    ):
+                        getLogger().warning(
+                            f"Queue {edge.queue} does not exist, exiting"
                         )
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
+                        break
+                    error_count += 1
+                    if error_count == 10:
+                        getLogger().critical(
+                            f"Recevied 10 errors in a row trying to receive from {edge.queue}, exiting"
+                        )
+                        raise e
+                    else:
                         getLogger().exception(
-                            f"Error handling recevied message for {self.__edge.name}"
+                            f"Error receiving messages from {edge.name}, retrying"
                         )
-                    self.__delete_message_queue.put_nowait(receipt_handle)
-        getLogger().info(f"Stopping receiving messages from {self.__edge.name}")
+                        await asyncio.sleep(10)
+                else:
+                    sqs_messages = response["Messages"]
+                    if not (self.__continue.is_set() and sqs_messages):
+                        continue
+                    getLogger().info(f"Received {len(sqs_messages)} from {edge.name}")
+                    for sqs_message in sqs_messages:
+                        message = Message(
+                            body=sqs_message["Body"],
+                            group_id=sqs_message["Attributes"]["MessageGroupId"],
+                            tracking_id=sqs_message["MessageAttributes"]
+                            .get("trackingId", {})
+                            .get("StringValue"),
+                            previous_tracking_ids=sqs_message["MessageAttributes"]
+                            .get("prevTrackingIds", {})
+                            .get("StringValue"),
+                        )
+                        receipt_handle = sqs_message["ReceiptHandle"]
+                        try:
+                            await node.handle_received_message(
+                                message=message, source=edge.name
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            getLogger().exception(
+                                f"Error handling recevied message for {edge.name}"
+                            )
+                        self.__delete_message_queue.put_nowait(receipt_handle)
+            getLogger().info(f"Stopping receiving messages from {edge.name}")
+
+        self.__task: asyncio.Task = asyncio.create_task(
+            receive(), name=f"SourceMessageReceiver({edge.name})"
+        )
 
     async def join(self) -> None:
-        done, pending = await asyncio.wait({self.__task})
+        done, pending = await asyncio.wait([self.__task])
         await self.__delete_message_queue.join()
 
     def stop(self) -> None:
@@ -323,72 +331,75 @@ class _TargetMessageQueue(asyncio.Queue):
         self.__edge = edge
         self.__task: asyncio.Task = None
 
-    async def __batcher(
-        self,
-    ) -> AsyncGenerator[list[SendMessageBatchRequestEntryTypeDef], None]:
-        batch: list[SendMessageBatchRequestEntryTypeDef] = list()
-        batch_length = 0
-        id = 0
-        while not self.empty():
-            try:
-                message = await asyncio.wait_for(self.get(), timeout=0.1)
-                if batch_length + message.length > 262144:
-                    yield batch
-                    batch = list()
-                    batch_length = 0
-                    id = 0
-                batch.append(
-                    SendMessageBatchRequestEntryTypeDef(
-                        Id=str(id), **message.sqs_message
-                    )
-                )
-                if len(batch) == 10:
-                    yield batch
-                    batch = list()
-                    batch_length = 0
-                    id = 0
-                id += 1
-                batch_length += message.length
-            except asyncio.TimeoutError:
-                if batch:
-                    yield batch
-                batch = list()
-                batch_length = 0
-                id = 0
-        if batch:
-            yield batch
-
-    async def __sender(self) -> None:
-        loop = asyncio.get_running_loop()
-        async for entries in self.__batcher():
-            try:
-                response = await loop.run_in_executor(
-                    None,
-                    partial(
-                        self.__node._sqs_client.send_message_batch,
-                        Entries=entries,
-                        QueueUrl=self.__edge.queue,
-                    ),
-                )
-                for failed in response["Failed"]:
-                    id = failed.pop("Id")
-                    getLogger().error(
-                        f"Unable to send message {entries[id]} to {self.__edge.name}, reason {failed}"
-                    )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                getLogger().exception(f"Error sending messages to {self.__edge.name}")
-            finally:
-                for _ in range(len(entries)):
-                    self.task_done()
-
     def _put(self, item: Any) -> None:
-        if self.empty() and (not self.__task or self.__task.done()):
+        async def batcher() -> AsyncGenerator[
+            list[SendMessageBatchRequestEntryTypeDef], None
+        ]:
+            batch: list[SendMessageBatchRequestEntryTypeDef] = list()
+            batch_length = 0
+            id = 0
+            while not self.empty():
+                try:
+                    message = await asyncio.wait_for(self.get(), timeout=0.1)
+                    if batch_length + message.length > 262144:
+                        yield batch
+                        batch = list()
+                        batch_length = 0
+                        id = 0
+                    batch.append(
+                        SendMessageBatchRequestEntryTypeDef(
+                            Id=str(id), **message.sqs_message
+                        )
+                    )
+                    if len(batch) == 10:
+                        yield batch
+                        batch = list()
+                        batch_length = 0
+                        id = 0
+                    id += 1
+                    batch_length += message.length
+                except asyncio.TimeoutError:
+                    if batch:
+                        yield batch
+                    batch = list()
+                    batch_length = 0
+                    id = 0
+            if batch:
+                yield batch
+
+        async def sender() -> None:
+            loop = asyncio.get_running_loop()
+            async for entries in batcher():
+                try:
+                    response = await loop.run_in_executor(
+                        None,
+                        partial(
+                            self.__node._sqs_client.send_message_batch,
+                            Entries=entries,
+                            QueueUrl=self.__edge.queue,
+                        ),
+                    )
+                    for failed in response["Failed"]:
+                        id = failed.pop("Id")
+                        getLogger().error(
+                            f"Unable to send message {entries[id]} to {self.__edge.name}, reason {failed}"
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    getLogger().exception(
+                        f"Error sending messages to {self.__edge.name}"
+                    )
+                finally:
+                    for _ in range(len(entries)):
+                        self.task_done()
+
+        empty = self.empty()
+        super()._put(item)
+        if empty and (not self.__task or self.__task.done()):
             self.__task = asyncio.create_task(
-                self.__sender(), name=f"TargetMessageSender({self.__edge.name})"
+                sender(), name=f"TargetMessageSender({self.__edge.name})"
             )
-        return super()._put(item)
 
     async def get(self) -> Message:
         return await super().get()
@@ -442,8 +453,18 @@ class Node(BaseNode):
 
     async def join(self) -> None:
         await self.__stop.wait()
-        await asyncio.gather(*list(map(_SourceMessageReceiver.join, self.__source_message_receivers)))
-        await asyncio.gather(*list(map(_TargetMessageQueue.join, self.__target_message_queues.values())))
+        await asyncio.gather(
+            *[
+                source_message_receiver.join()
+                for source_message_receiver in self.__source_message_receivers
+            ]
+        )
+        await asyncio.gather(
+            *[
+                target_message_queue.join()
+                for target_message_queue in self.__target_message_queues.values()
+            ]
+        )
         if self.__audit_records_queue:
             await self.__audit_records_queue.join()
         if self.__bulk_data_storage_queue:
@@ -497,9 +518,7 @@ class Node(BaseNode):
             Edge(name=edge["target"]["name"], queue=edge["queue"])
             for edge in data["sendEdges"]
         }
-        self.__audit_records_queue = _AuditRecordQueue(
-            self._receive_message_type, self
-        )
+        self.__audit_records_queue = _AuditRecordQueue(self._receive_message_type, self)
         self.__target_message_queues = {
             edge.name: _TargetMessageQueue(self, edge) for edge in self._targets
         }
