@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import logging
-from abc import ABC
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from os import cpu_count, environ
+from time import time
 from typing import TYPE_CHECKING, Any, Callable, Union
 
 import awsserviceendpoints
@@ -33,7 +34,7 @@ else:
 
 _CREATE_AUDIT_RECORDS = gql(
     """
-    query getNode($name: String!, $tenant: $String!, $messageType: String!, $auditRecords: [AuditRecord!]!) {
+    query getNode($name: String!, $tenant: String!, $messageType: String!, $auditRecords: [AuditRecord!]!) {
         GetNode(name: $name, tenant: $tenant) {
             ... on ExternalNode {
                 CreateAuditRecords(messageType: $messageType, auditRecords: $auditRecords) 
@@ -46,22 +47,36 @@ _CREATE_AUDIT_RECORDS = gql(
     """
 )
 
-_GET_BULK_DATA_STORAGE_GQL = gql(
+_GET_APP_GQL = gql(
     """
-    query getBulkDataStorage($tenant: String!) {
-        GetBulkDataStorage(tenant: $tenant, contentEncoding: gzip, count: 20) {
-            presignedGet
-            presignedPost {
-                expiration
-                fields
-                url
+    query getNode($name: String!, $tenant: String!) {
+        GetNode(name: $name, tenant: $tenant) {
+            __typename
+            ... on ExternalNode {
+                app {
+                    __typename
+                    ... on ExternalApp {
+                        name
+                    }
+                    ... on CrossAccountApp {
+                        name
+                    }
+                }
+            }
+            ... on ManagedNode {
+                app {
+                    name
+                }
+            }
+            tenant {
+                region
             }
         }
     }
     """
 )
 
-_GET_CREDENTIALS_GQL = gql(
+_GET_AWS_CREDENTIALS_GQL = gql(
     """
     query getAppAwsCredentials($name: String!, $tenant: String!, $duration: Int!) {
         GetApp(name: $name, tenant: $tenant) {
@@ -86,26 +101,16 @@ _GET_CREDENTIALS_GQL = gql(
     """
 )
 
-_GET_APP_GQL = gql(
+_GET_BULK_DATA_STORAGE_GQL = gql(
     """
-    query getNode($name: String!, $tenant: $String!) {
-        GetNode(name: $name, tenant: $tenant) {
-            __typename
-            ... on ExternalNode {
-                app {
-                    __typename
-                    ... on ExternalApp {
-                        name
-                    }
-                    ... on CrossAccountApp {
-                        name
-                    }
-                }
+    query getBulkDataStorage($tenant: String!) {
+        GetBulkDataStorage(tenant: $tenant, contentEncoding: gzip, count: 20) {
+            presignedGet
+            presignedPost {
+                expiration
+                fields
+                url
             }
-            ... on ManagedNode {
-                app {
-                    name
-                }
         }
     }
     """
@@ -113,14 +118,14 @@ _GET_APP_GQL = gql(
 
 _GET_NODE_GQL = gql(
     """
-    query getNode($name: String!, $tenant: $String!) {
+    query getNode($name: String!, $tenant: String!) {
         GetNode(name: $name, tenant: $tenant) {
             ... on ExternalNode {
                 app {
-                    .. on CrossAccountApp {
+                    ... on CrossAccountApp {
                         config
                     }
-                    .. on ExternalApp {
+                    ... on ExternalApp {
                         config
                     }
                 }
@@ -182,21 +187,16 @@ _GET_NODE_GQL = gql(
 
 
 class _NodeSession(BotocoreSession):
-    def __init__(self, node: Node, duration: int = 900) -> None:
+    def __init__(self, node: Node, duration: int = 3600) -> None:
         super().__init__()
 
         def refresher():
-            credentials = node._gql_client.execute(
-                _GET_CREDENTIALS_GQL,
-                variable_values=dict(
-                    name=node.app, tenant=node.tenant, duration=duration
-                ),
-            )["GetApp"]["GetAwsCredentials"]
+            credentials = node._get_aws_credentials(duration)
             return dict(
                 access_key=credentials["accessKeyId"],
-                secret_key=credentials["secret_key"],
-                token=credentials["sessionToken"],
                 expiry_time=credentials["expiration"],
+                secret_key=credentials["secretAccessKey"],
+                token=credentials["sessionToken"],
             )
 
         setattr(
@@ -213,21 +213,40 @@ Auditor = Callable[..., dict[str, Any]]
 
 @dataclass(frozen=True, init=False)
 class AuditRecord:
-    attributes: dict[str, Any]
-    date_time: datetime
-    tracking_id: str
-    previous_tracking_ids: frozenset[str]
+    extra_attributes: dict[str, Any]
+    date_time: str
+    message: Message
     source_node: str
 
     def __init__(
-        self, *, attributes: dict[str, Any], message: Message, source: str = None
+        self,
+        *,
+        message: Message,
+        extra_attributes: dict[str, Any] = None,
+        source: str = None,
     ) -> None:
         super().__init__()
-        super().__setattr__("attributes", attributes)
-        super().__setattr__("date_time", datetime.now(timezone.utc))
-        super().__setattr__("previous_tracking_ids", message.previous_tracking_ids)
+        super().__setattr__("extra_attributes", extra_attributes or dict())
+        super().__setattr__("date_time", datetime.now(timezone.utc).isoformat())
+        super().__setattr__("message", message)
         super().__setattr__("source_node", source)
-        super().__setattr__("tracking_id", message.tracking_id)
+
+    @property
+    def record(self) -> dict:
+        record = dict(
+            datetime=self.date_time,
+            trackingId=self.message.tracking_id,
+        )
+        if (
+            attributes := self.message.message_type.auditor(message=self.message.body)
+            | self.extra_attributes
+        ):
+            record["attributes"] = json.dumps(attributes, separators=(",", ":"))
+        if self.message.previous_tracking_ids:
+            record["previousTrackingIds"] = list(self.message.previous_tracking_ids)
+        if self.source_node:
+            record["sourceNode"] = self.source_node
+        return record
 
 
 @dataclass(frozen=True, init=False)
@@ -236,18 +255,20 @@ class BulkDataStorage:
     presigned_post: PresignedPost
 
     def __init__(self, bulk_data_storage: dict[str, Union[str, PresignedPost]]) -> None:
-        self.presigned_get = bulk_data_storage["presignedGet"]
-        self.presigned_post = PresignedPost(
-            expiration=datetime.fromisoformat(
-                bulk_data_storage["presignedPost"]["expiration"]
+        super().__init__()
+        super().__setattr__("presigned_get", bulk_data_storage["presignedGet"])
+        super().__setattr__(
+            "presigned_post",
+            PresignedPost(
+                expiration=bulk_data_storage["presignedPost"]["expiration"],
+                fields=bulk_data_storage["presignedPost"]["fields"],
+                url=bulk_data_storage["presignedPost"]["url"],
             ),
-            fields=bulk_data_storage["presignedPost"]["fields"],
-            url=bulk_data_storage["presignedPost"]["url"],
         )
 
     @property
     def expired(self) -> bool:
-        return self.presigned_post.expiration < datetime.utcnow()
+        return self.presigned_post.expiration < time()
 
 
 @dataclass(frozen=True)
@@ -263,12 +284,14 @@ LambdaEvent = Union[bool, dict, float, int, list, str, tuple, None]
 class Message:
     body: str
     group_id: str
+    message_type: MessageType
     tracking_id: str
     previous_tracking_ids: frozenset[str]
 
     def __init__(
         self,
         body: str,
+        message_type: MessageType,
         tracking_id: str,
         group_id: str = None,
         node: Node = None,
@@ -277,6 +300,7 @@ class Message:
         super().__init__()
         super().__setattr__("body", body)
         super().__setattr__("group_id", group_id or node.name.replace(" ", "_"))
+        super().__setattr__("message_type", message_type)
         super().__setattr__("tracking_id", tracking_id)
         if isinstance(previous_tracking_ids, str):
             previous_tracking_ids = json.loads(previous_tracking_ids)
@@ -324,6 +348,12 @@ class Message:
         return message_attributes
 
 
+@dataclass(frozen=True)
+class MessageType:
+    auditor: Auditor
+    name: str
+
+
 class Node(ABC):
     def __init__(
         self,
@@ -367,18 +397,21 @@ class Node(ABC):
             session = Session(botocore_session=_NodeSession(self))
         self.__sqs_client: SQSClient = session.client(
             "sqs",
-            Config(
+            config=Config(
                 max_pool_connections=min(20, ((cpu_count() or 1) + 4) * 2),
                 retries={"mode": "standard"},
             ),
+            region_name=data["tenant"]["region"],
         )
         self.__config: dict[str, Any] = None
-        self._receive_message_auditor: Auditor = None
-        self._receive_message_type: str = None
-        self._send_message_auditor: Auditor = None
-        self._send_message_type: str = None
         self.__sources: frozenset[Edge] = None
         self.__targets: frozenset[Edge] = None
+        self._receive_message_type: MessageType = None
+        self._send_message_type: MessageType = None
+
+    @abstractmethod
+    def _get_aws_credentials(self, duration: int = 900) -> dict[str, str]:
+        pass
 
     @property
     def _gql_client(self) -> GqlClient:
@@ -429,20 +462,12 @@ class Node(ABC):
         return self.__node_type
 
     @property
-    def receive_message_auditor(self) -> Auditor:
-        return self._receive_message_auditor or (lambda x: {})
-
-    @property
-    def receive_message_type(self) -> str:
+    def receive_message_type(self) -> MessageType:
         return self._receive_message_type
 
     @property
-    def send_message_type(self) -> str:
+    def send_message_type(self) -> MessageType:
         return self._send_message_type
-
-    @property
-    def send_message_auditor(self) -> Auditor:
-        return self._send_message_auditor or (lambda x: {})
 
     @property
     def tenant(self) -> str:
@@ -451,6 +476,6 @@ class Node(ABC):
 
 @dataclass(frozen=True)
 class PresignedPost:
-    expiration: datetime
+    expiration: int
     fields: dict[str, str]
     url: str
