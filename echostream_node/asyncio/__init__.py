@@ -15,16 +15,15 @@ from pycognito import Cognito
 
 from .. import (
     _CREATE_AUDIT_RECORDS,
+    _GET_AWS_CREDENTIALS_GQL,
     _GET_BULK_DATA_STORAGE_GQL,
     _GET_NODE_GQL,
     AuditRecord,
-    BulkDataStorage as BaseBulkDataStorage,
-    Edge,
-    Message,
-    Node as BaseNode,
-    PresignedPost,
-    getLogger,
 )
+from .. import BulkDataStorage as BaseBulkDataStorage
+from .. import Edge, Message, MessageType
+from .. import Node as BaseNode
+from .. import PresignedPost, getLogger
 
 if TYPE_CHECKING:
     from mypy_boto3_sqs.type_defs import (
@@ -37,7 +36,7 @@ else:
 
 
 class _AuditRecordQueue(asyncio.Queue):
-    def __init__(self, message_type: str, node: Node) -> None:
+    def __init__(self, message_type: MessageType, node: Node) -> None:
         super().__init__()
 
         async def sender() -> None:
@@ -60,30 +59,19 @@ class _AuditRecordQueue(asyncio.Queue):
 
             async for batch in batcher():
                 try:
-                    async with node._gql_client as session:
-                        await session.execute(
-                            _CREATE_AUDIT_RECORDS,
-                            variable_values=dict(
-                                name=node.name,
-                                tenant=node.tenant,
-                                messageType=message_type,
-                                auditRecords=[
-                                    dict(
-                                        attributes=json.dumps(
-                                            audit_record.attributes,
-                                            separators=(",", ":"),
-                                        ),
-                                        datetime=audit_record.date_time.isoformat(),
-                                        previousTrackingIds=list(
-                                            audit_record.previous_tracking_ids
-                                        ),
-                                        sourceNode=audit_record.source_node,
-                                        trackingId=audit_record.tracking_id,
-                                    )
-                                    for audit_record in batch
-                                ],
-                            ),
-                        )
+                    async with node._gql_client_lock:
+                        async with node._gql_client as session:
+                            await session.execute(
+                                _CREATE_AUDIT_RECORDS,
+                                variable_values=dict(
+                                    name=node.name,
+                                    tenant=node.tenant,
+                                    messageType=message_type.name,
+                                    auditRecords=[
+                                        audit_record.record for audit_record in batch
+                                    ],
+                                ),
+                            )
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -109,11 +97,12 @@ class _BulkDataStorageQueue(asyncio.Queue):
                     await asyncio.sleep(0.1)
                     continue
                 try:
-                    async with node._gql_client as session:
-                        bulk_data_storages = await session.execute(
-                            _GET_BULK_DATA_STORAGE_GQL,
-                            variable_values={"tenant", node.tenant},
-                        )
+                    async with node._gql_client_lock:
+                        async with node._gql_client as session:
+                            bulk_data_storages = await session.execute(
+                                _GET_BULK_DATA_STORAGE_GQL,
+                                variable_values={"tenant", node.tenant},
+                            )
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -131,7 +120,7 @@ class _BulkDataStorageQueue(asyncio.Queue):
         return bulk_data_storage if not bulk_data_storage.expired else self._get()
 
     async def get(self) -> BulkDataStorage:
-        return await self.get()
+        return await super().get()
 
     async def stop(self) -> None:
         await self.__client_session.close()
@@ -200,7 +189,7 @@ class _DeleteMessageQueue(asyncio.Queue):
                             QueueUrl=edge.queue,
                         ),
                     )
-                    for failed in response["Failed"]:
+                    for failed in response.get("Failed", list()):
                         id = failed.pop("Id")
                         getLogger().error(
                             f"Unable to send message {receipt_handles[id]} to {edge.name}, reason {failed}"
@@ -262,14 +251,17 @@ class _SourceMessageReceiver:
                         )
                         await asyncio.sleep(10)
                 else:
-                    sqs_messages = response["Messages"]
-                    if not (self.__continue.is_set() and sqs_messages):
+                    if not (
+                        self.__continue.is_set()
+                        and (sqs_messages := response.get("Messages"))
+                    ):
                         continue
                     getLogger().info(f"Received {len(sqs_messages)} from {edge.name}")
                     for sqs_message in sqs_messages:
                         message = Message(
                             body=sqs_message["Body"],
                             group_id=sqs_message["Attributes"]["MessageGroupId"],
+                            message_type=node.receive_message_type,
                             tracking_id=sqs_message["MessageAttributes"]
                             .get("trackingId", {})
                             .get("StringValue"),
@@ -402,11 +394,27 @@ class Node(BaseNode):
             user_pool_id=user_pool_id,
             username=username,
         )
+        self._gql_client_lock = asyncio.Lock()
         self.__bulk_data_storage_queue: _BulkDataStorageQueue = None
-        self.__audit_records_queue: _AuditRecordQueue = None
+        self.__audit_records_queues: dict[str, _AuditRecordQueue] = dict()
         self.__source_message_receivers: list[_SourceMessageReceiver] = list()
         self.__stop = asyncio.Event()
         self.__target_message_queues: dict[str, _TargetMessageQueue] = dict()
+
+    def _get_aws_credentials(self, duration: int = 3600) -> dict[str, str]:
+        loop = asyncio.get_event_loop()
+
+        async def get_aws_credentials() -> dict[str, str]:
+            async with self._gql_client_lock:
+                async with self._gql_client as session:
+                    return await session.execute(
+                        _GET_AWS_CREDENTIALS_GQL,
+                        variable_values=dict(
+                            name=self.app, tenant=self.tenant, duration=duration
+                        ),
+                    )["GetApp"]["GetAwsCredentials"]
+
+        return loop.run_until_complete(get_aws_credentials())
 
     async def handle_bulk_data(self, data: Union[bytearray, bytes]) -> str:
         return await (await self.__bulk_data_storage_queue.get()).handle_bulk_data(data)
@@ -428,13 +436,20 @@ class Node(BaseNode):
                 for target_message_queue in self.__target_message_queues.values()
             ]
         )
-        if self.__audit_records_queue:
-            await self.__audit_records_queue.join()
+        for audit_records_queue in self.__audit_records_queues.values():
+            await audit_records_queue.join()
         if self.__bulk_data_storage_queue:
             await self.__bulk_data_storage_queue.stop()
 
     def put_audit_record(self, audit_record: AuditRecord) -> None:
-        self.__audit_records_queue.put_nowait(audit_record)
+        try:
+            self.__audit_records_queues[
+                audit_record.message.message_type.name
+            ].put_nowait(audit_record)
+        except KeyError:
+            raise ValueError(
+                f"Unrecognized message type {audit_record.message.message_type.name}"
+            )
 
     async def send_message(
         self, /, message: Message, *, targets: set[str] = None
@@ -453,25 +468,32 @@ class Node(BaseNode):
     async def start(self) -> None:
         self.__stop.clear()
         self.__bulk_data_storage_queue = _BulkDataStorageQueue(self)
-        async with self._gql_client as session:
-            data: dict[str, dict] = await session.execute(
-                _GET_NODE_GQL,
-                variable_values=dict(name=self.name, tenant=self.tenant),
-            )["GetNode"]
+        async with self._gql_client_lock:
+            async with self._gql_client as session:
+                data: dict[str, dict] = await session.execute(
+                    _GET_NODE_GQL,
+                    variable_values=dict(name=self.name, tenant=self.tenant),
+                )["GetNode"]
         self.config = (
             json.loads(data["tenant"].get("config", {}))
             | json.loads(data["app"].get("config", {}))
             | json.loads(data.get("config", {}))
         )
         if receive_message_type := data.get("receiveMessageType"):
-            self._receive_message_type = receive_message_type["name"]
-            self._receive_message_auditor = dynamic_function_loader.load(
-                receive_message_type["auditor"]
+            self._receive_message_type = MessageType(
+                auditor=dynamic_function_loader.load(receive_message_type["auditor"]),
+                name=receive_message_type["name"],
             )
+            self.__audit_records_queues[
+                receive_message_type["name"]
+            ] = _AuditRecordQueue(self.receive_message_type, self)
         if send_message_type := data.get("sendMessageType"):
-            self._send_message_type = send_message_type["name"]
-            self._send_message_auditor = dynamic_function_loader.load(
-                send_message_type["auditor"]
+            self._send_message_type = MessageType(
+                auditor=dynamic_function_loader.load(send_message_type["auditor"]),
+                name=send_message_type["name"],
+            )
+            self.__audit_records_queues[send_message_type["name"]] = _AuditRecordQueue(
+                self.receive_message_type, self
             )
         self._sources = {
             Edge(name=edge["source"]["name"], queue=edge["queue"])
@@ -481,7 +503,6 @@ class Node(BaseNode):
             Edge(name=edge["target"]["name"], queue=edge["queue"])
             for edge in data["sendEdges"]
         }
-        self.__audit_records_queue = _AuditRecordQueue(self._receive_message_type, self)
         self.__target_message_queues = {
             edge.name: _TargetMessageQueue(self, edge) for edge in self._targets
         }
