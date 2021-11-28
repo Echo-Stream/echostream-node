@@ -452,18 +452,20 @@ class Node(BaseNode):
             )
 
     async def send_message(
-        self, /, message: Message, *, targets: set[str] = None
+        self, /, message: Message, *, targets: set[Edge] = None
     ) -> None:
         await self.send_messages([message], targets=targets)
 
     async def send_messages(
-        self, /, messages: list[Message], *, targets: set[str] = None
+        self, /, messages: list[Message], *, targets: set[Edge] = None
     ) -> None:
         if messages:
-            for target in targets or self._targets:
-                target_message_queue = self.__target_message_queues[target]
-                for message in messages:
-                    target_message_queue.put_nowait(message)
+            for target in targets or self.targets:
+                if target_message_queue := self.__target_message_queues.get(target.name):
+                    for message in messages:
+                        target_message_queue.put_nowait(message)
+                else:
+                    getLogger().warning(f"Target {target.name} does not exist")
 
     async def start(self) -> None:
         self.__stop.clear()

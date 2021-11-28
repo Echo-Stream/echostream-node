@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from os import cpu_count, environ
 from time import time
 from typing import TYPE_CHECKING, Any, Callable, Union
+from uuid import uuid4
 
 import awsserviceendpoints
 import simplejson as json
@@ -243,7 +244,7 @@ class AuditRecord:
         ):
             record["attributes"] = json.dumps(attributes, separators=(",", ":"))
         if self.message.previous_tracking_ids:
-            record["previousTrackingIds"] = list(self.message.previous_tracking_ids)
+            record["previousTrackingIds"] = self.message.previous_tracking_ids
         if self.source_node:
             record["sourceNode"] = self.source_node
         return record
@@ -286,27 +287,27 @@ class Message:
     group_id: str
     message_type: MessageType
     tracking_id: str
-    previous_tracking_ids: frozenset[str]
+    previous_tracking_ids: list[str]
 
     def __init__(
         self,
         body: str,
         message_type: MessageType,
-        tracking_id: str,
         group_id: str = None,
         node: Node = None,
-        previous_tracking_ids: Union[set[str], list[str], str] = None,
+        previous_tracking_ids: Union[list[str], str] = None,
+        tracking_id: str = None,
     ) -> None:
         super().__init__()
         super().__setattr__("body", body)
         super().__setattr__("group_id", group_id or node.name.replace(" ", "_"))
         super().__setattr__("message_type", message_type)
-        super().__setattr__("tracking_id", tracking_id)
+        super().__setattr__("tracking_id", tracking_id or uuid4().hex)
         if isinstance(previous_tracking_ids, str):
             previous_tracking_ids = json.loads(previous_tracking_ids)
         super().__setattr__(
             "previous_tracking_ids",
-            frozenset(previous_tracking_ids) if previous_tracking_ids else None,
+            previous_tracking_ids if previous_tracking_ids else None,
         )
         if self.length > 262144:
             raise ValueError(f"Message is > 262,144 in size")
@@ -342,7 +343,7 @@ class Message:
             message_attributes["prevTrackingIds"] = MessageAttributeValueTypeDef(
                 DataType="String",
                 StringValue=json.dumps(
-                    list(self.previous_tracking_ids), separators=(",", ":")
+                    self.previous_tracking_ids, separators=(",", ":")
                 ),
             )
         return message_attributes
@@ -468,6 +469,14 @@ class Node(ABC):
     @property
     def send_message_type(self) -> MessageType:
         return self._send_message_type
+
+    @property
+    def sources(self) -> frozenset[Edge]:
+        return self._sources
+
+    @property
+    def targets(self) -> frozenset[Edge]:
+        return self._targets
 
     @property
     def tenant(self) -> str:

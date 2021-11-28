@@ -169,7 +169,7 @@ class _TargetMessageQueue(Queue):
                     response = node._sqs_client.send_message_batch(
                         Entries=entries, QueueUrl=edge.queue
                     )
-                    for failed in response["Failed"]:
+                    for failed in response.get("Failed", list()):
                         id = failed.pop("Id")
                         getLogger().error(
                             f"Unable to send message {entries[id]} to {edge.name}, reason {failed}"
@@ -260,19 +260,22 @@ class Node(BaseNode):
                 f"Unrecognized message type {audit_record.message.message_type.name}"
             )
 
-    def send_message(self, /, message: Message, *, targets: set[str] = None) -> None:
+    def send_message(self, /, message: Message, *, targets: set[Edge] = None) -> None:
         self.send_messages([message], targets=targets)
 
     def send_messages(
-        self, /, messages: list[Message], *, targets: set[str] = None
+        self, /, messages: list[Message], *, targets: set[Edge] = None
     ) -> None:
         if messages:
-            for target in targets or self._targets:
-                target_message_queue = self.__target_message_queues[target]
-                for message in messages:
-                    target_message_queue.put_nowait(message)
+            for target in targets or self.targets:
+                if target_message_queue := self.__target_message_queues.get(target.name):
+                    for message in messages:
+                        target_message_queue.put_nowait(message)
+                else:
+                    getLogger().warning(f"Target {target.name} does not exist")
 
     def start(self) -> None:
+        getLogger().info(f"Starting Node {self.name}")
         self.__stop.clear()
         with self._gql_client_lock:
             data: dict[str, dict] = self._gql_client.execute(
@@ -395,10 +398,7 @@ class _SourceMessageReceiver(Thread):
                         )
                         sleep(10)
                 else:
-                    if not (
-                        self.__continue.is_set()
-                        and (sqs_messages := response.get("Messages"))
-                    ):
+                    if not (sqs_messages := response.get("Messages")):
                         continue
                     getLogger().info(f"Received {len(sqs_messages)} from {edge.name}")
                     for sqs_message in sqs_messages:
@@ -425,9 +425,7 @@ class _SourceMessageReceiver(Thread):
                         self.__delete_message_queue.put_nowait(receipt_handle)
             getLogger().info(f"Stopping receiving messages from {edge.name}")
 
-        super().__init__(
-            daemon=True, name=f"SourceMessageReceiver({edge.name})", target=receive
-        )
+        super().__init__(name=f"SourceMessageReceiver({edge.name})", target=receive)
         self.start()
 
     def join(self) -> None:
