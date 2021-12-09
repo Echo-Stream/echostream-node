@@ -4,7 +4,7 @@ aws-lambda-context
 awsserviceendpoints
 black
 boto3
-boto3-stubs[sqs]
+boto3-stubs[dynamodb,sqs]
 build
 dynamic-function-loader
 gql[aiohttp,requests]==3.0.0b0

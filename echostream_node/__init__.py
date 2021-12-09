@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from os import cpu_count, environ
+from threading import get_ident
 from time import time
 from typing import TYPE_CHECKING, Any, Callable, Union
 from uuid import uuid4
@@ -27,11 +28,13 @@ def getLogger() -> logging.Logger:
 getLogger().addHandler(logging.NullHandler())
 
 if TYPE_CHECKING:
+    from mypy_boto3_dynamodb.service_resource import Table
     from mypy_boto3_sqs.client import SQSClient
     from mypy_boto3_sqs.type_defs import MessageAttributeValueTypeDef
 else:
     MessageAttributeValueTypeDef = dict
     SQSClient = object
+    Table = object
 
 _CREATE_AUDIT_RECORDS = gql(
     """
@@ -71,6 +74,7 @@ _GET_APP_GQL = gql(
             }
             tenant {
                 region
+                table
             }
         }
     }
@@ -213,44 +217,6 @@ Auditor = Callable[..., dict[str, Any]]
 
 
 @dataclass(frozen=True, init=False)
-class AuditRecord:
-    extra_attributes: dict[str, Any]
-    date_time: str
-    message: Message
-    source_node: str
-
-    def __init__(
-        self,
-        *,
-        message: Message,
-        extra_attributes: dict[str, Any] = None,
-        source: str = None,
-    ) -> None:
-        super().__init__()
-        super().__setattr__("extra_attributes", extra_attributes or dict())
-        super().__setattr__("date_time", datetime.now(timezone.utc).isoformat())
-        super().__setattr__("message", message)
-        super().__setattr__("source_node", source)
-
-    @property
-    def record(self) -> dict:
-        record = dict(
-            datetime=self.date_time,
-            trackingId=self.message.tracking_id,
-        )
-        if (
-            attributes := self.message.message_type.auditor(message=self.message.body)
-            | self.extra_attributes
-        ):
-            record["attributes"] = json.dumps(attributes, separators=(",", ":"))
-        if self.message.previous_tracking_ids:
-            record["previousTrackingIds"] = self.message.previous_tracking_ids
-        if self.source_node:
-            record["sourceNode"] = self.source_node
-        return record
-
-
-@dataclass(frozen=True, init=False)
 class BulkDataStorage:
     presigned_get: str
     presigned_post: PresignedPost
@@ -285,6 +251,8 @@ LambdaEvent = Union[bool, dict, float, int, list, str, tuple, None]
 class Message:
     body: str
     group_id: str
+    length: int
+    message_attributes: dict[str, MessageAttributeValueTypeDef]
     message_type: MessageType
     tracking_id: str
     previous_tracking_ids: list[str]
@@ -294,13 +262,12 @@ class Message:
         body: str,
         message_type: MessageType,
         group_id: str = None,
-        node: Node = None,
         previous_tracking_ids: Union[list[str], str] = None,
         tracking_id: str = None,
     ) -> None:
         super().__init__()
         super().__setattr__("body", body)
-        super().__setattr__("group_id", group_id or node.name.replace(" ", "_"))
+        super().__setattr__("group_id", group_id)
         super().__setattr__("message_type", message_type)
         super().__setattr__("tracking_id", tracking_id or uuid4().hex)
         if isinstance(previous_tracking_ids, str):
@@ -309,31 +276,6 @@ class Message:
             "previous_tracking_ids",
             previous_tracking_ids if previous_tracking_ids else None,
         )
-        if self.length > 262144:
-            raise ValueError(f"Message is > 262,144 in size")
-
-    @property
-    def sqs_message(self) -> dict:
-        return dict(
-            MessageAttributes=self.message_attributes,
-            MessageBody=self.body,
-            MessageGroupId=self.group_id,
-        )
-
-    @property
-    def length(self) -> int:
-        length = len(self.body)
-        for name, attribute in self.message_attributes.items():
-            value = attribute[
-                "StringValue"
-                if (data_type := attribute["DataType"]) in ("String", "Number")
-                else "BinaryValue"
-            ]
-            length += len(name) + len(data_type) + len(value)
-        return length
-
-    @property
-    def message_attributes(self) -> dict[str, MessageAttributeValueTypeDef]:
         message_attributes = dict(
             trackingId=MessageAttributeValueTypeDef(
                 DataType="String", StringValue=self.tracking_id
@@ -346,7 +288,28 @@ class Message:
                     self.previous_tracking_ids, separators=(",", ":")
                 ),
             )
-        return message_attributes
+        super().__setattr__("message_attributes", message_attributes)
+        length = len(self.body)
+        for name, attribute in self.message_attributes.items():
+            value = attribute[
+                "StringValue"
+                if (data_type := attribute["DataType"]) in ("String", "Number")
+                else "BinaryValue"
+            ]
+            length += len(name) + len(data_type) + len(value)
+        if length > 262144:
+            raise ValueError(f"Message is > 262,144 in size")
+        super().__setattr__("length", length)
+
+    def __len__(self) -> int:
+        return self.length
+
+    def _sqs_message(self, node: Node) -> dict:
+        return dict(
+            MessageAttributes=self.message_attributes,
+            MessageBody=self.body,
+            MessageGroupId=self.group_id or node.name.replace(" ", "_"),
+        )
 
 
 @dataclass(frozen=True)
@@ -365,6 +328,7 @@ class Node(ABC):
         name: str = None,
         password: str = None,
         tenant: str = None,
+        timeout: float = None,
         user_pool_id: str = None,
         username: str = None,
     ) -> None:
@@ -391,12 +355,12 @@ class Node(ABC):
         self.__app = data["app"]["name"]
         self.__node_type = data["__typename"]
         self.__app_type = data["app"]["__typename"]
-        session: Session = None
+        self.__session: Session = None
         if self.__node_type == "ExternalNode" and self.__app_type == "CrossAccountApp":
-            session = Session()
+            self.__session = Session()
         else:
-            session = Session(botocore_session=_NodeSession(self))
-        self.__sqs_client: SQSClient = session.client(
+            self.__session = Session(botocore_session=_NodeSession(self))
+        self.__sqs_client: SQSClient = self.__session.client(
             "sqs",
             config=Config(
                 max_pool_connections=min(20, ((cpu_count() or 1) + 4) * 2),
@@ -406,7 +370,10 @@ class Node(ABC):
         )
         self.__config: dict[str, Any] = None
         self.__sources: frozenset[Edge] = None
+        self.__state_table: str = data["tenant"]["table"]
+        self.__state_tables: dict[int, Table] = dict()
         self.__targets: frozenset[Edge] = None
+        self.__timeout = timeout or 0.1
         self._receive_message_type: MessageType = None
         self._send_message_type: MessageType = None
 
@@ -454,6 +421,21 @@ class Node(ABC):
     def config(self, config: dict[str, Any]) -> None:
         self.__config = config
 
+    def create_message(
+        self,
+        /,
+        body: str,
+        *,
+        group_id: str = None,
+        previous_tracking_ids: Union[list[str], str] = None,
+    ) -> Message:
+        return Message(
+            body=body,
+            group_id=group_id,
+            message_type=self.send_message_type,
+            previous_tracking_ids=previous_tracking_ids,
+        )
+
     @property
     def name(self) -> str:
         return self.__name
@@ -475,12 +457,29 @@ class Node(ABC):
         return self._sources
 
     @property
+    def state_table(self) -> Table:
+        thread_ident = get_ident()
+        if not (table := self.__state_tables.get(thread_ident)):
+            self.__state_tables[thread_ident] = table = self.__session.resource(
+                "dynamodb"
+            ).Table(self.__state_table)
+        return table
+
+    @property
     def targets(self) -> frozenset[Edge]:
         return self._targets
 
     @property
     def tenant(self) -> str:
         return self.__tenant
+
+    @property
+    def timeout(self) -> float:
+        return self.__timeout
+
+    @timeout.setter
+    def timeout(self, timeout: float) -> None:
+        self.__timeout = timeout or 0.1
 
 
 @dataclass(frozen=True)

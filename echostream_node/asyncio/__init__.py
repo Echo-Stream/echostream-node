@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 from functools import partial
 from gzip import GzipFile
 from io import BytesIO
@@ -18,7 +19,6 @@ from .. import (
     _GET_AWS_CREDENTIALS_GQL,
     _GET_BULK_DATA_STORAGE_GQL,
     _GET_NODE_GQL,
-    AuditRecord,
 )
 from .. import BulkDataStorage as BaseBulkDataStorage
 from .. import Edge, Message, MessageType
@@ -41,13 +41,15 @@ class _AuditRecordQueue(asyncio.Queue):
 
         async def sender() -> None:
             async def batcher() -> AsyncGenerator[
-                list[AuditRecord],
+                list[dict],
                 None,
             ]:
-                batch: list[AuditRecord] = list()
+                batch: list[dict] = list()
                 while True:
                     try:
-                        batch.append(await asyncio.wait_for(self.get(), timeout=0.1))
+                        batch.append(
+                            await asyncio.wait_for(self.get(), timeout=node.timeout)
+                        )
                     except asyncio.TimeoutError:
                         if batch:
                             yield batch
@@ -67,9 +69,7 @@ class _AuditRecordQueue(asyncio.Queue):
                                     name=node.name,
                                     tenant=node.tenant,
                                     messageType=message_type.name,
-                                    auditRecords=[
-                                        audit_record.record for audit_record in batch
-                                    ],
+                                    auditRecords=batch,
                                 ),
                             )
                 except asyncio.CancelledError:
@@ -82,7 +82,7 @@ class _AuditRecordQueue(asyncio.Queue):
 
         asyncio.create_task(sender(), name=f"AuditRecordsSender")
 
-    async def get(self) -> AuditRecord:
+    async def get(self) -> dict:
         return await super().get()
 
 
@@ -94,7 +94,7 @@ class _BulkDataStorageQueue(asyncio.Queue):
         async def filler() -> None:
             while True:
                 if self.qsize() >= 20:
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(0)
                     continue
                 try:
                     async with node._gql_client_lock:
@@ -163,7 +163,9 @@ class _DeleteMessageQueue(asyncio.Queue):
                 batch: list[str] = list()
                 while True:
                     try:
-                        batch.append(await asyncio.wait_for(self.get(), timeout=0.1))
+                        batch.append(
+                            await asyncio.wait_for(self.get(), timeout=node.timeout)
+                        )
                     except asyncio.TimeoutError:
                         if batch:
                             yield batch
@@ -304,7 +306,9 @@ class _TargetMessageQueue(asyncio.Queue):
                 id = 0
                 while True:
                     try:
-                        message = await asyncio.wait_for(self.get(), timeout=0.1)
+                        message = await asyncio.wait_for(
+                            self.get(), timeout=node.timeout
+                        )
                     except asyncio.TimeoutError:
                         if batch:
                             yield batch
@@ -312,14 +316,14 @@ class _TargetMessageQueue(asyncio.Queue):
                         batch_length = 0
                         id = 0
                     else:
-                        if batch_length + message.length > 262144:
+                        if batch_length + len(message) > 262144:
                             yield batch
                             batch = list()
                             batch_length = 0
                             id = 0
                         batch.append(
                             SendMessageBatchRequestEntryTypeDef(
-                                Id=str(id), **message.sqs_message
+                                Id=str(id), **message._sqs_message(node)
                             )
                         )
                         if len(batch) == 10:
@@ -328,7 +332,7 @@ class _TargetMessageQueue(asyncio.Queue):
                             batch_length = 0
                             id = 0
                         id += 1
-                        batch_length += message.length
+                        batch_length += len(message)
 
             loop = asyncio.get_running_loop()
             async for entries in batcher():
@@ -381,6 +385,7 @@ class Node(BaseNode):
         name: str = None,
         password: str = None,
         tenant: str = None,
+        timeout: float = None,
         user_pool_id: str = None,
         username: str = None,
     ) -> None:
@@ -391,6 +396,7 @@ class Node(BaseNode):
             name=name,
             password=password,
             tenant=tenant,
+            timeout=timeout,
             user_pool_id=user_pool_id,
             username=username,
         )
@@ -415,6 +421,31 @@ class Node(BaseNode):
                     )["GetApp"]["GetAwsCredentials"]
 
         return loop.run_until_complete(get_aws_credentials())
+
+    def audit_message(
+        self,
+        /,
+        message: Message,
+        *,
+        extra_attributes: dict[str, Any] = None,
+        source: str = None,
+    ) -> None:
+        extra_attributes = extra_attributes or dict()
+        message_type = message.message_type
+        record = dict(
+            datetime=datetime.now(timezone.utc).isoformat(),
+            previousTrackingIds=message.previous_tracking_ids,
+            sourceNode=source,
+            trackingId=message.tracking_id,
+        )
+        if attributes := (
+            message_type.auditor(message=message.body) | extra_attributes
+        ):
+            record["attributes"] = json.dumps(attributes, separators=(",", ":"))
+        try:
+            self.__audit_records_queues[message_type.name].put_nowait(record)
+        except KeyError:
+            raise ValueError(f"Unrecognized message type {message_type.name}")
 
     async def handle_bulk_data(self, data: Union[bytearray, bytes]) -> str:
         return await (await self.__bulk_data_storage_queue.get()).handle_bulk_data(data)
@@ -441,16 +472,6 @@ class Node(BaseNode):
         if self.__bulk_data_storage_queue:
             await self.__bulk_data_storage_queue.stop()
 
-    def put_audit_record(self, audit_record: AuditRecord) -> None:
-        try:
-            self.__audit_records_queues[
-                audit_record.message.message_type.name
-            ].put_nowait(audit_record)
-        except KeyError:
-            raise ValueError(
-                f"Unrecognized message type {audit_record.message.message_type.name}"
-            )
-
     async def send_message(
         self, /, message: Message, *, targets: set[Edge] = None
     ) -> None:
@@ -461,7 +482,9 @@ class Node(BaseNode):
     ) -> None:
         if messages:
             for target in targets or self.targets:
-                if target_message_queue := self.__target_message_queues.get(target.name):
+                if target_message_queue := self.__target_message_queues.get(
+                    target.name
+                ):
                     for message in messages:
                         target_message_queue.put_nowait(message)
                 else:

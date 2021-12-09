@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from gzip import GzipFile
 from io import BytesIO
 from queue import Empty, Queue
@@ -20,7 +21,6 @@ from .. import (
     _GET_AWS_CREDENTIALS_GQL,
     _GET_BULK_DATA_STORAGE_GQL,
     _GET_NODE_GQL,
-    AuditRecord,
 )
 from .. import BulkDataStorage as BaseBulkDataStorage
 from .. import Edge, LambdaEvent, Message, MessageType
@@ -43,10 +43,10 @@ class _AuditRecordQueue(Queue):
 
         def sender() -> None:
             while True:
-                batch: list[AuditRecord] = list()
+                batch: list[dict] = list()
                 while len(batch) < 500:
                     try:
-                        batch.append(self.get(timeout=0.1))
+                        batch.append(self.get(timeout=node.timeout))
                     except Empty:
                         break
                 if not batch:
@@ -59,9 +59,7 @@ class _AuditRecordQueue(Queue):
                                 name=node.name,
                                 tenant=node.tenant,
                                 messageType=message_type.name,
-                                auditRecords=[
-                                    audit_record.record for audit_record in batch
-                                ],
+                                auditRecords=batch,
                             ),
                         )
                 except Exception:
@@ -72,7 +70,7 @@ class _AuditRecordQueue(Queue):
 
         Thread(daemon=True, name=f"AuditRecordsSender", target=sender).start()
 
-    def get(self, block: bool = True, timeout: float = None) -> AuditRecord:
+    def get(self, block: bool = True, timeout: float = None) -> dict:
         return super().get(block=block, timeout=timeout)
 
 
@@ -138,15 +136,15 @@ class _TargetMessageQueue(Queue):
             id = 0
             while True:
                 try:
-                    message = self.get(timeout=0.1)
-                    if batch_length + message.length > 262144:
+                    message = self.get(timeout=node.timeout)
+                    if batch_length + len(message) > 262144:
                         yield batch
                         batch = list()
                         batch_length = 0
                         id = 0
                     batch.append(
                         SendMessageBatchRequestEntryTypeDef(
-                            Id=str(id), **message.sqs_message
+                            Id=str(id), **message._sqs_message(node)
                         )
                     )
                     if len(batch) == 10:
@@ -155,7 +153,7 @@ class _TargetMessageQueue(Queue):
                         batch_length = 0
                         id = 0
                     id += 1
-                    batch_length += message.length
+                    batch_length += len(message)
                 except Empty:
                     if batch:
                         yield batch
@@ -209,6 +207,7 @@ class Node(BaseNode):
         name: str = None,
         password: str = None,
         tenant: str = None,
+        timeout: float = None,
         user_pool_id: str = None,
         username: str = None,
     ) -> None:
@@ -219,6 +218,7 @@ class Node(BaseNode):
             name=name,
             password=password,
             tenant=tenant,
+            timeout=timeout,
             user_pool_id=user_pool_id,
             username=username,
         )
@@ -237,6 +237,31 @@ class Node(BaseNode):
                 ),
             )["GetApp"]["GetAwsCredentials"]
 
+    def audit_message(
+        self,
+        /,
+        message: Message,
+        *,
+        extra_attributes: dict[str, Any] = None,
+        source: str = None,
+    ) -> None:
+        extra_attributes = extra_attributes or dict()
+        message_type = message.message_type
+        record = dict(
+            datetime=datetime.now(timezone.utc).isoformat(),
+            previousTrackingIds=message.previous_tracking_ids,
+            sourceNode=source,
+            trackingId=message.tracking_id,
+        )
+        if attributes := (
+            message_type.auditor(message=message.body) | extra_attributes
+        ):
+            record["attributes"] = json.dumps(attributes, separators=(",", ":"))
+        try:
+            self.__audit_records_queues[message_type.name].put_nowait(record)
+        except KeyError:
+            raise ValueError(f"Unrecognized message type {message_type.name}")
+
     def handle_bulk_data(self, data: Union[bytearray, bytes]) -> str:
         return self.__bulk_data_storage_queue.get().handle_bulk_data(data)
 
@@ -250,16 +275,6 @@ class Node(BaseNode):
         for audit_records_queue in self.__audit_records_queues.values():
             audit_records_queue.join()
 
-    def put_audit_record(self, audit_record: AuditRecord) -> None:
-        try:
-            self.__audit_records_queues[
-                audit_record.message.message_type.name
-            ].put_nowait(audit_record)
-        except KeyError:
-            raise ValueError(
-                f"Unrecognized message type {audit_record.message.message_type.name}"
-            )
-
     def send_message(self, /, message: Message, *, targets: set[Edge] = None) -> None:
         self.send_messages([message], targets=targets)
 
@@ -268,7 +283,9 @@ class Node(BaseNode):
     ) -> None:
         if messages:
             for target in targets or self.targets:
-                if target_message_queue := self.__target_message_queues.get(target.name):
+                if target_message_queue := self.__target_message_queues.get(
+                    target.name
+                ):
                     for message in messages:
                         target_message_queue.put_nowait(message)
                 else:
@@ -328,7 +345,7 @@ class _DeleteMessageQueue(Queue):
                 receipt_handles: list[str] = list()
                 while len(receipt_handles) < 10:
                     try:
-                        receipt_handles.append(self.get(timeout=0.1))
+                        receipt_handles.append(self.get(timeout=node.timeout))
                     except Empty:
                         break
                 if not receipt_handles:
@@ -445,6 +462,7 @@ class AppNode(Node):
         name: str = None,
         password: str = None,
         tenant: str = None,
+        timeout: float = None,
         user_pool_id: str = None,
         username: str = None,
     ) -> None:
@@ -454,6 +472,7 @@ class AppNode(Node):
             name=name,
             password=password,
             tenant=tenant,
+            timeout=timeout,
             user_pool_id=user_pool_id,
             username=username,
         )
@@ -485,6 +504,7 @@ class LambdaNode(Node):
         name: str = None,
         password: str = None,
         tenant: str = None,
+        timeout: float = None,
         user_pool_id: str = None,
         username: str = None,
     ) -> None:
@@ -494,6 +514,7 @@ class LambdaNode(Node):
             name=name,
             password=password,
             tenant=tenant,
+            timeout=timeout,
             user_pool_id=user_pool_id,
             username=username,
         )
