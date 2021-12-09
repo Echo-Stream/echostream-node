@@ -61,15 +61,18 @@ _GET_APP_GQL = gql(
                     __typename
                     ... on ExternalApp {
                         name
+                        tableAccess
                     }
                     ... on CrossAccountApp {
                         name
+                        tableAccess
                     }
                 }
             }
             ... on ManagedNode {
                 app {
                     name
+                    tableAccess
                 }
             }
             tenant {
@@ -370,8 +373,10 @@ class Node(ABC):
         )
         self.__config: dict[str, Any] = None
         self.__sources: frozenset[Edge] = None
-        self.__state_table: str = data["tenant"]["table"]
-        self.__state_tables: dict[int, Table] = dict()
+        self.__table: str = None
+        if data["app"].get("tableAccess"):
+            self.__table: str = data["tenant"]["table"]
+        self.__tables: dict[int, Table] = dict()
         self.__targets: frozenset[Edge] = None
         self.__timeout = timeout or 0.1
         self._receive_message_type: MessageType = None
@@ -457,12 +462,14 @@ class Node(ABC):
         return self._sources
 
     @property
-    def state_table(self) -> Table:
-        thread_ident = get_ident()
-        if not (table := self.__state_tables.get(thread_ident)):
-            self.__state_tables[thread_ident] = table = self.__session.resource(
-                "dynamodb"
-            ).Table(self.__state_table)
+    def table(self) -> Table:
+        table: Table = None
+        if self.__table:
+            thread_ident = get_ident()
+            if not (table := self.__tables.get(thread_ident)):
+                self.__tables[thread_ident] = table = self.__session.resource(
+                    "dynamodb"
+                ).Table(self.__table)
         return table
 
     @property
