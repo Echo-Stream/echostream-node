@@ -472,12 +472,12 @@ class Node(BaseNode):
         if self.__bulk_data_storage_queue:
             await self.__bulk_data_storage_queue.stop()
 
-    async def send_message(
+    def send_message(
         self, /, message: Message, *, targets: set[Edge] = None
     ) -> None:
-        await self.send_messages([message], targets=targets)
+        self.send_messages([message], targets=targets)
 
-    async def send_messages(
+    def send_messages(
         self, /, messages: list[Message], *, targets: set[Edge] = None
     ) -> None:
         if messages:
