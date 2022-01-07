@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from os import cpu_count, environ
 from threading import get_ident
 from time import time
@@ -339,7 +338,7 @@ class Node(ABC):
         cognito = Cognito(
             client_id=client_id or environ["CLIENT_ID"],
             user_pool_id=user_pool_id or environ["USER_POOL_ID"],
-            username=username or environ["USERNAME"],
+            username=username or environ["USER_NAME"],
         )
         cognito.authenticate(password=password or environ["PASSWORD"])
         self.__gql_client = GqlClient(
