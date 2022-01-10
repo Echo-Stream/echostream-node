@@ -70,6 +70,7 @@ _GET_APP_GQL = gql(
             }
             ... on ManagedNode {
                 app {
+                    __typename
                     name
                     tableAccess
                 }
