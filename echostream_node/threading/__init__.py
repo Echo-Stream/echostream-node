@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from gzip import GzipFile
 from io import BytesIO
 from queue import Empty, Queue
-from threading import Condition, Event, RLock, Thread
+from threading import Event, RLock, Thread
 from time import sleep
 from typing import TYPE_CHECKING, Any, BinaryIO, Generator, Union
 from uuid import uuid4
@@ -93,32 +93,34 @@ class _BulkDataStorage(BaseBulkDataStorage):
 class _BulkDataStorageQueue(Queue):
     def __init__(self, node: Node) -> None:
         super().__init__()
-        self.fill = Condition()
+        self.__fill = Event()
 
         def filler() -> None:
             while True:
-                if not self.qsize() != 0:
-                    with self.fill:
-                        self.fill.wait()
-                with node._gql_client_lock:
-                    bulk_data_storages: list[dict] = node._gql_client.execute(
-                        _GET_BULK_DATA_STORAGE_GQL,
-                        variable_values={"tenant": node.tenant},
-                    )["GetBulkDataStorage"]
-                for bulk_data_storage in bulk_data_storages:
-                    self.put(_BulkDataStorage(bulk_data_storage))
+                self.__fill.wait()
+                try:
+                    with node._gql_client_lock:
+                        bulk_data_storages: list[dict] = node._gql_client.execute(
+                            _GET_BULK_DATA_STORAGE_GQL,
+                            variable_values={"tenant": node.tenant},
+                        )["GetBulkDataStorage"]
+                except Exception:
+                    getLogger().exception("Error getting bulk data storage")
+                else:
+                    for bulk_data_storage in bulk_data_storages:
+                        self.put_nowait(_BulkDataStorage(bulk_data_storage))
+                self.__fill.clear()
 
         Thread(daemon=True, name="BulkDataStorageQueueFiller", target=filler).start()
 
     def get(self, block: bool = True, timeout: float = None) -> _BulkDataStorage:
-        with self.fill:
-            if self.qsize() < 20:
-                self.fill.notify()
+        if self.qsize() < 20:
+            self.__fill.set()
         bulk_data_storage: _BulkDataStorage = super().get(block=block, timeout=timeout)
         return (
-            self.get(block=block, timeout=timeout)
-            if bulk_data_storage.expired
-            else bulk_data_storage
+            bulk_data_storage
+            if not bulk_data_storage.expired
+            else self.get(block=block, timeout=timeout)
         )
 
 
@@ -488,6 +490,10 @@ class AppNode(Node):
         self.__source_message_receivers = [
             _SourceMessageReceiver(edge, self) for edge in self._sources
         ]
+
+    def start_and_run_forever(self) -> None:
+        self.start()
+        self.join()
 
     def stop(self) -> None:
         for app_node_receiver in self.__source_message_receivers:
