@@ -109,7 +109,7 @@ class _BulkDataStorageQueue(asyncio.Queue):
                                 bulk_data_storages: list[dict] = (
                                     await session.execute(
                                         _GET_BULK_DATA_STORAGE_GQL,
-                                        variable_values={"tenant", node.tenant},
+                                        variable_values={"tenant": node.tenant},
                                     )
                                 )["GetBulkDataStorage"]
                     except Exception:
