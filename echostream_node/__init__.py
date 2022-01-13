@@ -231,7 +231,7 @@ class BulkDataStorage:
             "presigned_post",
             PresignedPost(
                 expiration=bulk_data_storage["presignedPost"]["expiration"],
-                fields=bulk_data_storage["presignedPost"]["fields"],
+                fields=json.loads(bulk_data_storage["presignedPost"]["fields"]),
                 url=bulk_data_storage["presignedPost"]["url"],
             ),
         )
