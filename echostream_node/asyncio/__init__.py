@@ -205,12 +205,12 @@ class _DeleteMessageQueue(asyncio.Queue):
                 except asyncio.CancelledError:
                     cancelled.set()
                 except Exception:
-                    getLogger().exception(f"Error sending messages to {edge.name}")
+                    getLogger().exception(f"Error deleting messages from {edge.name}")
                 finally:
                     for failed in response.get("Failed", list()):
                         id = failed.pop("Id")
                         getLogger().error(
-                            f"Unable to send message {receipt_handles[id]} to {edge.name}, reason {failed}"
+                            f"Unable to delete message {receipt_handles[id]} from {edge.name}, reason {failed}"
                         )
                     for _ in range(len(receipt_handles)):
                         self.task_done()
@@ -505,6 +505,7 @@ class Node(BaseNode):
                     getLogger().warning(f"Target {target.name} does not exist")
 
     async def start(self) -> None:
+        getLogger().info(f"Starting Node {self.name}")
         self._gql_client_lock = asyncio.Lock()
         self.__loop = asyncio.get_running_loop()
         self.__bulk_data_storage_queue = _BulkDataStorageQueue(self)
