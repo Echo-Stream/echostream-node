@@ -297,13 +297,13 @@ class Node(BaseNode):
         getLogger().info(f"Starting Node {self.name}")
         self.__stop.clear()
         with self._gql_client_lock:
-            data: dict[str, dict] = self._gql_client.execute(
+            data: dict[str, Union[str, dict]] = self._gql_client.execute(
                 _GET_NODE_GQL,
                 variable_values=dict(name=self.name, tenant=self.tenant),
             )["GetNode"]
         self.config = (
             json.loads(data["tenant"].get("config") or "{}")
-            | json.loads(data["app"].get("config") or "{}")
+            | json.loads((data.get("app") or dict()).get("config") or "{}")
             | json.loads(data.get("config") or "{}")
         )
         if receive_message_type := data.get("receiveMessageType"):
@@ -322,13 +322,19 @@ class Node(BaseNode):
             self.__audit_records_queues[send_message_type["name"]] = _AuditRecordQueue(
                 self._send_message_type, self
             )
-        self._sources = {
-            Edge(name=edge["source"]["name"], queue=edge["queue"])
-            for edge in data["receiveEdges"]
-        }
+        if self.node_type == "AppChangeReceiverNode":
+            if edge := data.get("receiveEdge"):
+                self._sources = {Edge(name=edge["source"]["name"], queue=edge["queue"])}
+            else:
+                self._sources = set()
+        else:
+            self._sources = {
+                Edge(name=edge["source"]["name"], queue=edge["queue"])
+                for edge in (data.get("receiveEdges") or list())
+            }
         self._targets = {
             Edge(name=edge["target"]["name"], queue=edge["queue"])
-            for edge in data["sendEdges"]
+            for edge in (data.get("sendEdges") or list())
         }
         self.__target_message_queues = {
             edge.name: _TargetMessageQueue(self, edge) for edge in self._targets

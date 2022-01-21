@@ -39,6 +39,9 @@ _CREATE_AUDIT_RECORDS = gql(
     """
     query getNode($name: String!, $tenant: String!, $messageType: String!, $auditRecords: [AuditRecord!]!) {
         GetNode(name: $name, tenant: $tenant) {
+            ... on AppChangeReceiverNode {
+                CreateAuditRecords(messageType: $messageType, auditRecords: $auditRecords) 
+            }
             ... on ExternalNode {
                 CreateAuditRecords(messageType: $messageType, auditRecords: $auditRecords) 
             }
@@ -55,14 +58,31 @@ _GET_APP_GQL = gql(
     query getNode($name: String!, $tenant: String!) {
         GetNode(name: $name, tenant: $tenant) {
             __typename
-            ... on ExternalNode {
+            ... on AppChangeReceiverNode {
                 app {
                     __typename
+                    ... on CrossAccountApp {
+                        name
+                        tableAccess
+                    }
                     ... on ExternalApp {
                         name
                         tableAccess
                     }
+                    ... on ManagedApp {
+                        name
+                        tableAccess
+                    }
+                }
+            }
+            ... on ExternalNode {
+                app {
+                    __typename
                     ... on CrossAccountApp {
+                        name
+                        tableAccess
+                    }
+                    ... on ExternalApp {
                         name
                         tableAccess
                     }
@@ -128,6 +148,18 @@ _GET_NODE_GQL = gql(
     """
     query getNode($name: String!, $tenant: String!) {
         GetNode(name: $name, tenant: $tenant) {
+            ... on AppChangeReceiverNode {
+                receiveEdge {
+                    queue
+                    source {
+                        name
+                    }
+                }
+                receiveMessageType {
+                    auditor
+                    name
+                }
+            }
             ... on ExternalNode {
                 app {
                     ... on CrossAccountApp {
@@ -351,7 +383,7 @@ class Node(ABC):
         )
         self.__name = name or environ["NODE"]
         self.__tenant = tenant or environ["TENANT"]
-        data = self.__gql_client.execute(
+        data: dict[str, Union[str, dict]] = self.__gql_client.execute(
             _GET_APP_GQL,
             variable_values=dict(name=self.__name, tenant=self.__tenant),
         )["GetNode"]
@@ -359,7 +391,7 @@ class Node(ABC):
         self.__node_type = data["__typename"]
         self.__app_type = data["app"]["__typename"]
         self.__session: Session = None
-        if self.__node_type == "ExternalNode" and self.__app_type == "CrossAccountApp":
+        if self.__app_type == "CrossAccountApp":
             self.__session = Session()
         else:
             self.__session = Session(botocore_session=_NodeSession(self))
