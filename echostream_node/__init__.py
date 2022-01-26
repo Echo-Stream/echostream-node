@@ -390,12 +390,10 @@ class Node(ABC):
         self.__app = data["app"]["name"]
         self.__node_type = data["__typename"]
         self.__app_type = data["app"]["__typename"]
-        self.__session: Session = None
-        if self.__app_type == "CrossAccountApp":
-            self.__session = Session()
-        else:
-            self.__session = Session(botocore_session=_NodeSession(self))
-        self.__sqs_client: SQSClient = self.__session.client(
+        self.__session = Session(botocore_session=_NodeSession(self))
+        self.__sqs_client: SQSClient = (
+            Session() if self.__app_type == "CrossAccountApp" else self.__session
+        ).client(
             "sqs",
             config=Config(
                 max_pool_connections=min(20, ((cpu_count() or 1) + 4) * 2),
