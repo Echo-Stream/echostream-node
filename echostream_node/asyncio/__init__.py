@@ -215,7 +215,9 @@ class _DeleteMessageQueue(asyncio.Queue):
                     for _ in range(len(receipt_handles)):
                         self.task_done()
 
-        self.__task = asyncio.create_task(deleter(), name=f"SourceMessageDeleter({edge.name})")
+        self.__task = asyncio.create_task(
+            deleter(), name=f"SourceMessageDeleter({edge.name})"
+        )
 
     def cancel(self) -> bool:
         return self.__task.cancel()
@@ -289,7 +291,8 @@ class _SourceMessageReceiver:
                             getLogger().exception(
                                 f"Error handling recevied message for {edge.name}"
                             )
-                        self.__delete_message_queue.put_nowait(receipt_handle)
+                        else:
+                            self.__delete_message_queue.put_nowait(receipt_handle)
             getLogger().info(f"Stopping receiving messages from {edge.name}")
 
         self.__task = asyncio.create_task(

@@ -447,7 +447,8 @@ class _SourceMessageReceiver(Thread):
                             getLogger().exception(
                                 f"Error handling recevied message for {edge.name}"
                             )
-                        self.__delete_message_queue.put_nowait(receipt_handle)
+                        else:
+                            self.__delete_message_queue.put_nowait(receipt_handle)
             getLogger().info(f"Stopping receiving messages from {edge.name}")
 
         super().__init__(name=f"SourceMessageReceiver({edge.name})", target=receive)
