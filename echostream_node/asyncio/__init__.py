@@ -16,7 +16,6 @@ from pycognito import Cognito
 
 from .. import (
     _CREATE_AUDIT_RECORDS,
-    _GET_AWS_CREDENTIALS_GQL,
     _GET_BULK_DATA_STORAGE_GQL,
     _GET_NODE_GQL,
 )
@@ -69,17 +68,16 @@ class _AuditRecordQueue(asyncio.Queue):
 
             async for batch in batcher():
                 try:
-                    async with node._gql_client_lock:
-                        async with node._gql_client as session:
-                            await session.execute(
-                                _CREATE_AUDIT_RECORDS,
-                                variable_values=dict(
-                                    name=node.name,
-                                    tenant=node.tenant,
-                                    messageType=message_type.name,
-                                    auditRecords=batch,
-                                ),
-                            )
+                    async with node._gql_client as session:
+                        await session.execute(
+                            _CREATE_AUDIT_RECORDS,
+                            variable_values=dict(
+                                name=node.name,
+                                tenant=node.tenant,
+                                messageType=message_type.name,
+                                auditRecords=batch,
+                            ),
+                        )
                 except asyncio.CancelledError:
                     cancelled.set()
                 except Exception:
@@ -88,49 +86,13 @@ class _AuditRecordQueue(asyncio.Queue):
                     for _ in range(len(batch)):
                         self.task_done()
 
-        self.__task = asyncio.create_task(sender(), name=f"AuditRecordsSender")
+        asyncio.create_task(sender(), name=f"AuditRecordsSender")
 
     async def get(self) -> dict:
         return await super().get()
 
 
-class _BulkDataStorageQueue(asyncio.Queue):
-    def __init__(self, node: Node) -> None:
-        super().__init__()
-        self.__fill = asyncio.Event()
-
-        async def filler() -> None:
-            async with ClientSession() as client_session:
-                while True:
-                    await self.__fill.wait()
-                    try:
-                        async with node._gql_client_lock:
-                            async with node._gql_client as session:
-                                bulk_data_storages: list[dict] = (
-                                    await session.execute(
-                                        _GET_BULK_DATA_STORAGE_GQL,
-                                        variable_values={"tenant": node.tenant},
-                                    )
-                                )["GetBulkDataStorage"]
-                    except Exception:
-                        getLogger().exception("Error getting bulk data storage")
-                    else:
-                        for bulk_data_storage in bulk_data_storages:
-                            self.put_nowait(
-                                BulkDataStorage(bulk_data_storage, client_session)
-                            )
-                    self.__fill.clear()
-
-        self.__task = asyncio.create_task(filler(), name="BulkDataStorageQueueFiller")
-
-    async def get(self) -> BulkDataStorage:
-        if self.qsize() < 20:
-            self.__fill.set()
-        bulk_data_storage: BulkDataStorage = await super().get()
-        return bulk_data_storage if not bulk_data_storage.expired else await self.get()
-
-
-class BulkDataStorage(BaseBulkDataStorage):
+class _BulkDataStorage(BaseBulkDataStorage):
     def __init__(
         self,
         bulk_data_storage: dict[str, Union[str, PresignedPost]],
@@ -153,6 +115,56 @@ class BulkDataStorage(BaseBulkDataStorage):
             ) as response:
                 response.raise_for_status()
         return self.presigned_get
+
+
+class _BulkDataStorageQueue(asyncio.Queue):
+    def __init__(self, node: Node) -> None:
+        super().__init__()
+        self.__fill = asyncio.Event()
+
+        async def filler() -> None:
+            async with ClientSession() as client_session:
+                cancelled = asyncio.Event()
+                while not cancelled.is_set():
+                    bulk_data_storages: list[dict] = list()
+                    try:
+                        await self.__fill.wait()
+                        async with node._gql_client as session:
+                            bulk_data_storages = (
+                                await session.execute(
+                                    _GET_BULK_DATA_STORAGE_GQL,
+                                    variable_values={"tenant": node.tenant},
+                                )
+                            )["GetBulkDataStorage"]
+                    except asyncio.CancelledError:
+                        cancelled.set()
+                    except Exception:
+                        getLogger().exception("Error getting bulk data storage")
+                    for bulk_data_storage in bulk_data_storages:
+                        self.put_nowait(
+                            _BulkDataStorage(bulk_data_storage, client_session)
+                        )
+                    self.__fill.clear()
+
+        asyncio.create_task(filler(), name="BulkDataStorageQueueFiller")
+
+    async def get(self) -> _BulkDataStorage:
+        if self.qsize() < 20:
+            self.__fill.set()
+        bulk_data_storage: _BulkDataStorage = await super().get()
+        return bulk_data_storage if not bulk_data_storage.expired else await self.get()
+
+
+class _CognitoAIOHTTPTransport(AIOHTTPTransport):
+    def __init__(self, cognito: Cognito, url: str, **kwargs: Any) -> None:
+        self._cognito = cognito
+        super().__init__(url, **kwargs)
+
+    def __getattribute__(self, name: str) -> Any:
+        if name == "headers":
+            self._cognito.check_token()
+            return dict(Authorization=self._cognito.access_token)
+        return super().__getattribute__(name)
 
 
 class _DeleteMessageQueue(asyncio.Queue):
@@ -215,12 +227,7 @@ class _DeleteMessageQueue(asyncio.Queue):
                     for _ in range(len(receipt_handles)):
                         self.task_done()
 
-        self.__task = asyncio.create_task(
-            deleter(), name=f"SourceMessageDeleter({edge.name})"
-        )
-
-    def cancel(self) -> bool:
-        return self.__task.cancel()
+        asyncio.create_task(deleter(), name=f"SourceMessageDeleter({edge.name})")
 
     async def get(self) -> str:
         return await super().get()
@@ -300,7 +307,7 @@ class _SourceMessageReceiver:
         )
 
     async def join(self) -> None:
-        done, pending = await asyncio.wait([self.__task])
+        await asyncio.wait([self.__task])
         await self.__delete_message_queue.join()
 
 
@@ -384,18 +391,6 @@ class _TargetMessageQueue(asyncio.Queue):
         return await super().get()
 
 
-class CognitoAIOHTTPTransport(AIOHTTPTransport):
-    def __init__(self, cognito: Cognito, url: str, **kwargs: Any) -> None:
-        self._cognito = cognito
-        super().__init__(url, **kwargs)
-
-    def __getattribute__(self, name: str) -> Any:
-        if name == "headers":
-            self._cognito.check_token()
-            return dict(Authorization=self._cognito.access_token)
-        return super().__getattribute__(name)
-
-
 class Node(BaseNode):
     def __init__(
         self,
@@ -410,9 +405,9 @@ class Node(BaseNode):
         username: str = None,
     ) -> None:
         super().__init__(
-            gql_transport_cls=CognitoAIOHTTPTransport,
             appsync_endpoint=appsync_endpoint,
             client_id=client_id,
+            gql_transport_cls=_CognitoAIOHTTPTransport,
             name=name,
             password=password,
             tenant=tenant,
@@ -420,29 +415,10 @@ class Node(BaseNode):
             user_pool_id=user_pool_id,
             username=username,
         )
-        self._gql_client_lock: asyncio.Lock = None
         self.__audit_records_queues: dict[str, _AuditRecordQueue] = dict()
         self.__bulk_data_storage_queue: _BulkDataStorageQueue = None
-        self.__loop: asyncio.events.AbstractEventLoop = None
         self.__source_message_receivers: list[_SourceMessageReceiver] = list()
         self.__target_message_queues: dict[str, _TargetMessageQueue] = dict()
-
-    def _get_aws_credentials(self, duration: int = 3600) -> dict[str, str]:
-        async def get_aws_credentials() -> dict[str, str]:
-            async with self._gql_client_lock:
-                async with self._gql_client as session:
-                    return (
-                        await session.execute(
-                            _GET_AWS_CREDENTIALS_GQL,
-                            variable_values=dict(
-                                name=self.app, tenant=self.tenant, duration=duration
-                            ),
-                        )
-                    )["GetApp"]["GetAwsCredentials"]
-
-        return asyncio.run_coroutine_threadsafe(
-            get_aws_credentials(), self.__loop
-        ).result()
 
     def audit_message(
         self,
@@ -509,17 +485,14 @@ class Node(BaseNode):
 
     async def start(self) -> None:
         getLogger().info(f"Starting Node {self.name}")
-        self._gql_client_lock = asyncio.Lock()
-        self.__loop = asyncio.get_running_loop()
         self.__bulk_data_storage_queue = _BulkDataStorageQueue(self)
-        async with self._gql_client_lock:
-            async with self._gql_client as session:
-                data: dict[str, Union[str, dict]] = (
-                    await session.execute(
-                        _GET_NODE_GQL,
-                        variable_values=dict(name=self.name, tenant=self.tenant),
-                    )
-                )["GetNode"]
+        async with self._gql_client as session:
+            data: dict[str, Union[str, dict]] = (
+                await session.execute(
+                    _GET_NODE_GQL,
+                    variable_values=dict(name=self.name, tenant=self.tenant),
+                )
+            )["GetNode"]
         self.config = (
             json.loads(data["tenant"].get("config") or "{}")
             | json.loads((data.get("app") or dict()).get("config") or "{}")

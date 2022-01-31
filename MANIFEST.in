@@ -1,2 +1,1 @@
 include pyproject.toml
-include echo_tools/apps/managed_app_templates/*

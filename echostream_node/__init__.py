@@ -17,6 +17,7 @@ from botocore.credentials import DeferredRefreshableCredentials
 from botocore.session import Session as BotocoreSession
 from gql import Client as GqlClient
 from gql import gql
+from gql.transport.requests import RequestsHTTPTransport
 from pycognito import Cognito
 
 
@@ -226,12 +227,32 @@ _GET_NODE_GQL = gql(
 )
 
 
-class _NodeSession(BotocoreSession):
-    def __init__(self, node: Node, duration: int = 3600) -> None:
+class _CognitoRequestsHTTPTransport(RequestsHTTPTransport):
+    def __init__(self, cognito: Cognito, url: str, **kwargs: Any) -> None:
+        self._cognito = cognito
+        super().__init__(url, **kwargs)
+
+    def __getattribute__(self, name: str) -> Any:
+        if name == "headers":
+            self._cognito.check_token()
+            return dict(Authorization=self._cognito.access_token)
+        return super().__getattribute__(name)
+
+
+class _NodeBotocoreSession(BotocoreSession):
+    def __init__(
+        self, *, node: Node, gql_client: GqlClient, duration: int = None
+    ) -> None:
         super().__init__()
 
         def refresher():
-            credentials = node._get_aws_credentials(duration)
+            with gql_client as session:
+                credentials = session.execute(
+                    _GET_AWS_CREDENTIALS_GQL,
+                    variable_values=dict(
+                        name=node.app, tenant=node.tenant, duration=duration or 3600
+                    ),
+                )["GetApp"]["GetAwsCredentials"]
             return dict(
                 access_key=credentials["accessKeyId"],
                 expiry_time=credentials["expiration"],
@@ -357,9 +378,9 @@ class Node(ABC):
     def __init__(
         self,
         *,
-        gql_transport_cls: type,
         appsync_endpoint: str = None,
         client_id: str = None,
+        gql_transport_cls: type = _CognitoRequestsHTTPTransport,
         name: str = None,
         password: str = None,
         tenant: str = None,
@@ -374,23 +395,39 @@ class Node(ABC):
             username=username or environ["USER_NAME"],
         )
         cognito.authenticate(password=password or environ["PASSWORD"])
-        self.__gql_client = GqlClient(
+        name = name or environ["NODE"]
+        tenant = tenant or environ["TENANT"]
+        gql_client = GqlClient(
             fetch_schema_from_transport=True,
-            transport=gql_transport_cls(
+            transport=_CognitoRequestsHTTPTransport(
                 cognito,
                 appsync_endpoint or environ["APPSYNC_ENDPOINT"],
             ),
         )
-        self.__name = name or environ["NODE"]
-        self.__tenant = tenant or environ["TENANT"]
-        data: dict[str, Union[str, dict]] = self.__gql_client.execute(
-            _GET_APP_GQL,
-            variable_values=dict(name=self.__name, tenant=self.__tenant),
-        )["GetNode"]
+        with gql_client as session:
+            data: dict[str, Union[str, dict]] = session.execute(
+                _GET_APP_GQL,
+                variable_values=dict(name=name, tenant=tenant),
+            )["GetNode"]
         self.__app = data["app"]["name"]
-        self.__node_type = data["__typename"]
         self.__app_type = data["app"]["__typename"]
-        self.__session = Session(botocore_session=_NodeSession(self))
+        self.__config: dict[str, Any] = None
+        if gql_transport_cls == _CognitoRequestsHTTPTransport:
+            self.__gql_client = gql_client
+        else:
+            self.__gql_client = GqlClient(
+                fetch_schema_from_transport=True,
+                transport=gql_transport_cls(
+                    cognito,
+                    appsync_endpoint or environ["APPSYNC_ENDPOINT"],
+                ),
+            )
+        self.__name = name
+        self.__node_type = data["__typename"]
+        self.__session = Session(
+            botocore_session=_NodeBotocoreSession(node=self, gql_client=gql_client)
+        )
+        self.__sources: frozenset[Edge] = None
         self.__sqs_client: SQSClient = (
             Session() if self.__app_type == "CrossAccountApp" else self.__session
         ).client(
@@ -401,20 +438,14 @@ class Node(ABC):
             ),
             region_name=data["tenant"]["region"],
         )
-        self.__config: dict[str, Any] = None
-        self.__sources: frozenset[Edge] = None
-        self.__table: str = None
-        if data["app"].get("tableAccess"):
-            self.__table: str = data["tenant"]["table"]
-        self.__tables: dict[int, Table] = dict()
+        self.__table: str = (
+            data["tenant"]["table"] if data["app"].get("tableAccess") else None
+        )
         self.__targets: frozenset[Edge] = None
+        self.__tenant = tenant
         self.__timeout = timeout or 0.1
         self._receive_message_type: MessageType = None
         self._send_message_type: MessageType = None
-
-    @abstractmethod
-    def _get_aws_credentials(self, duration: int = 900) -> dict[str, str]:
-        pass
 
     @property
     def _gql_client(self) -> GqlClient:
@@ -493,14 +524,9 @@ class Node(ABC):
 
     @property
     def table(self) -> Table:
-        table: Table = None
         if self.__table:
-            thread_ident = get_ident()
-            if not (table := self.__tables.get(thread_ident)):
-                self.__tables[thread_ident] = table = self.__session.resource(
-                    "dynamodb"
-                ).Table(self.__table)
-        return table
+            return self.__session.resource("dynamodb").Table(self.__table)
+        raise RuntimeError(f"App {self.app} does not have tableAccess")
 
     @property
     def targets(self) -> frozenset[Edge]:

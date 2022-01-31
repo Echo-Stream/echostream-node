@@ -5,20 +5,17 @@ from datetime import datetime, timezone
 from gzip import GzipFile
 from io import BytesIO
 from queue import Empty, Queue
-from threading import Event, RLock, Thread
+from threading import Event, Thread
 from time import sleep
 from typing import TYPE_CHECKING, Any, BinaryIO, Generator, Union
 from uuid import uuid4
 
 import dynamic_function_loader
 from aws_error_utils import catch_aws_error
-from gql.transport.requests import RequestsHTTPTransport
-from pycognito import Cognito
 from requests import post
 
 from .. import (
     _CREATE_AUDIT_RECORDS,
-    _GET_AWS_CREDENTIALS_GQL,
     _GET_BULK_DATA_STORAGE_GQL,
     _GET_NODE_GQL,
 )
@@ -52,8 +49,8 @@ class _AuditRecordQueue(Queue):
                 if not batch:
                     continue
                 try:
-                    with node._gql_client_lock:
-                        node._gql_client.execute(
+                    with node._gql_client as session:
+                        session.execute(
                             _CREATE_AUDIT_RECORDS,
                             variable_values=dict(
                                 name=node.name,
@@ -99,8 +96,8 @@ class _BulkDataStorageQueue(Queue):
             while True:
                 self.__fill.wait()
                 try:
-                    with node._gql_client_lock:
-                        bulk_data_storages: list[dict] = node._gql_client.execute(
+                    with node._gql_client as session:
+                        bulk_data_storages: list[dict] = session.execute(
                             _GET_BULK_DATA_STORAGE_GQL,
                             variable_values={"tenant": node.tenant},
                         )["GetBulkDataStorage"]
@@ -188,18 +185,6 @@ class _TargetMessageQueue(Queue):
         return super().get(block=block, timeout=timeout)
 
 
-class CognitoRequestsHTTPTransport(RequestsHTTPTransport):
-    def __init__(self, cognito: Cognito, url: str, **kwargs: Any) -> None:
-        self._cognito = cognito
-        super().__init__(url, **kwargs)
-
-    def __getattribute__(self, name: str) -> Any:
-        if name == "headers":
-            self._cognito.check_token()
-            return dict(Authorization=self._cognito.access_token)
-        return super().__getattribute__(name)
-
-
 class Node(BaseNode):
     def __init__(
         self,
@@ -214,7 +199,6 @@ class Node(BaseNode):
         username: str = None,
     ) -> None:
         super().__init__(
-            gql_transport_cls=CognitoRequestsHTTPTransport,
             appsync_endpoint=appsync_endpoint,
             client_id=client_id,
             name=name,
@@ -224,20 +208,10 @@ class Node(BaseNode):
             user_pool_id=user_pool_id,
             username=username,
         )
-        self._gql_client_lock = RLock()
         self.__bulk_data_storage_queue = _BulkDataStorageQueue(self)
         self.__audit_records_queues: dict[str, _AuditRecordQueue] = dict()
         self.__stop = Event()
         self.__target_message_queues: dict[str, _TargetMessageQueue] = dict()
-
-    def _get_aws_credentials(self, duration: int = 3600) -> dict[str, str]:
-        with self._gql_client_lock:
-            return self._gql_client.execute(
-                _GET_AWS_CREDENTIALS_GQL,
-                variable_values=dict(
-                    name=self.app, tenant=self.tenant, duration=duration
-                ),
-            )["GetApp"]["GetAwsCredentials"]
 
     def audit_message(
         self,
@@ -296,8 +270,8 @@ class Node(BaseNode):
     def start(self) -> None:
         getLogger().info(f"Starting Node {self.name}")
         self.__stop.clear()
-        with self._gql_client_lock:
-            data: dict[str, Union[str, dict]] = self._gql_client.execute(
+        with self._gql_client as session:
+            data: dict[str, Union[str, dict]] = session.execute(
                 _GET_NODE_GQL,
                 variable_values=dict(name=self.name, tenant=self.tenant),
             )["GetNode"]
