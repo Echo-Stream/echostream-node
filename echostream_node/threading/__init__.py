@@ -209,7 +209,6 @@ class Node(BaseNode):
         self.__bulk_data_storage_queue = _BulkDataStorageQueue(self)
         self.__audit_records_queues: dict[str, _AuditRecordQueue] = dict()
         self.__lock = RLock()
-        self.__stop = Event()
         self.__target_message_queues: dict[str, _TargetMessageQueue] = dict()
 
     @property
@@ -248,7 +247,6 @@ class Node(BaseNode):
         pass
 
     def join(self) -> None:
-        self.__stop.wait()
         for target_message_queue in self.__target_message_queues.values():
             target_message_queue.join()
         for audit_records_queue in self.__audit_records_queues.values():
@@ -272,7 +270,6 @@ class Node(BaseNode):
 
     def start(self) -> None:
         getLogger().info(f"Starting Node {self.name}")
-        self.__stop.clear()
         with self._lock:
             with self._gql_client as session:
                 data: dict[str, Union[str, dict]] = session.execute(
@@ -319,7 +316,7 @@ class Node(BaseNode):
         }
 
     def stop(self) -> None:
-        self.__stop.set()
+        pass
 
 
 class _DeleteMessageQueue(Queue):
@@ -483,7 +480,6 @@ class AppNode(Node):
     def stop(self) -> None:
         for app_node_receiver in self.__source_message_receivers:
             app_node_receiver.stop()
-        super().stop()
 
 
 class LambdaNode(Node):
@@ -509,7 +505,7 @@ class LambdaNode(Node):
             user_pool_id=user_pool_id,
             username=username,
         )
-        super().start()
+        self.start()
         self.__queue_name_to_source = {
             edge.queue.split("/")[-1:][0]: edge.name for edge in self._sources
         }
