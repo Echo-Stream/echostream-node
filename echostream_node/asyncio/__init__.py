@@ -14,11 +14,7 @@ from aws_error_utils import catch_aws_error
 from gql.transport.aiohttp import AIOHTTPTransport
 from pycognito import Cognito
 
-from .. import (
-    _CREATE_AUDIT_RECORDS,
-    _GET_BULK_DATA_STORAGE_GQL,
-    _GET_NODE_GQL,
-)
+from .. import _CREATE_AUDIT_RECORDS, _GET_BULK_DATA_STORAGE_GQL, _GET_NODE_GQL
 from .. import BulkDataStorage as BaseBulkDataStorage
 from .. import Edge, Message, MessageType
 from .. import Node as BaseNode
@@ -68,16 +64,17 @@ class _AuditRecordQueue(asyncio.Queue):
 
             async for batch in batcher():
                 try:
-                    async with node._gql_client as session:
-                        await session.execute(
-                            _CREATE_AUDIT_RECORDS,
-                            variable_values=dict(
-                                name=node.name,
-                                tenant=node.tenant,
-                                messageType=message_type.name,
-                                auditRecords=batch,
-                            ),
-                        )
+                    async with node._lock:
+                        async with node._gql_client as session:
+                            await session.execute(
+                                _CREATE_AUDIT_RECORDS,
+                                variable_values=dict(
+                                    name=node.name,
+                                    tenant=node.tenant,
+                                    messageType=message_type.name,
+                                    auditRecords=batch,
+                                ),
+                            )
                 except asyncio.CancelledError:
                     cancelled.set()
                 except Exception:
@@ -129,13 +126,14 @@ class _BulkDataStorageQueue(asyncio.Queue):
                     bulk_data_storages: list[dict] = list()
                     try:
                         await self.__fill.wait()
-                        async with node._gql_client as session:
-                            bulk_data_storages = (
-                                await session.execute(
-                                    _GET_BULK_DATA_STORAGE_GQL,
-                                    variable_values={"tenant": node.tenant},
-                                )
-                            )["GetBulkDataStorage"]
+                        async with node._lock:
+                            async with node._gql_client as session:
+                                bulk_data_storages = (
+                                    await session.execute(
+                                        _GET_BULK_DATA_STORAGE_GQL,
+                                        variable_values={"tenant": node.tenant},
+                                    )
+                                )["GetBulkDataStorage"]
                     except asyncio.CancelledError:
                         cancelled.set()
                     except Exception:
@@ -417,8 +415,13 @@ class Node(BaseNode):
         )
         self.__audit_records_queues: dict[str, _AuditRecordQueue] = dict()
         self.__bulk_data_storage_queue: _BulkDataStorageQueue = None
+        self.__lock: asyncio.Lock = None
         self.__source_message_receivers: list[_SourceMessageReceiver] = list()
         self.__target_message_queues: dict[str, _TargetMessageQueue] = dict()
+
+    @property
+    def _lock(self) -> asyncio.Lock:
+        return self.__lock
 
     def audit_message(
         self,
@@ -485,14 +488,16 @@ class Node(BaseNode):
 
     async def start(self) -> None:
         getLogger().info(f"Starting Node {self.name}")
+        self.__lock = asyncio.Lock()
         self.__bulk_data_storage_queue = _BulkDataStorageQueue(self)
-        async with self._gql_client as session:
-            data: dict[str, Union[str, dict]] = (
-                await session.execute(
-                    _GET_NODE_GQL,
-                    variable_values=dict(name=self.name, tenant=self.tenant),
-                )
-            )["GetNode"]
+        async with self.__lock:
+            async with self._gql_client as session:
+                data: dict[str, Union[str, dict]] = (
+                    await session.execute(
+                        _GET_NODE_GQL,
+                        variable_values=dict(name=self.name, tenant=self.tenant),
+                    )
+                )["GetNode"]
         self.config = (
             json.loads(data["tenant"].get("config") or "{}")
             | json.loads((data.get("app") or dict()).get("config") or "{}")

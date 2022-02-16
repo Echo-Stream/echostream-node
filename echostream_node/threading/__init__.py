@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from gzip import GzipFile
 from io import BytesIO
 from queue import Empty, Queue
-from threading import Event, Thread
+from threading import Event, RLock, Thread
 from time import sleep
 from typing import TYPE_CHECKING, Any, BinaryIO, Generator, Union
 from uuid import uuid4
@@ -14,11 +14,7 @@ import dynamic_function_loader
 from aws_error_utils import catch_aws_error
 from requests import post
 
-from .. import (
-    _CREATE_AUDIT_RECORDS,
-    _GET_BULK_DATA_STORAGE_GQL,
-    _GET_NODE_GQL,
-)
+from .. import _CREATE_AUDIT_RECORDS, _GET_BULK_DATA_STORAGE_GQL, _GET_NODE_GQL
 from .. import BulkDataStorage as BaseBulkDataStorage
 from .. import Edge, LambdaEvent, Message, MessageType
 from .. import Node as BaseNode
@@ -49,16 +45,17 @@ class _AuditRecordQueue(Queue):
                 if not batch:
                     continue
                 try:
-                    with node._gql_client as session:
-                        session.execute(
-                            _CREATE_AUDIT_RECORDS,
-                            variable_values=dict(
-                                name=node.name,
-                                tenant=node.tenant,
-                                messageType=message_type.name,
-                                auditRecords=batch,
-                            ),
-                        )
+                    with node._lock:
+                        with node._gql_client as session:
+                            session.execute(
+                                _CREATE_AUDIT_RECORDS,
+                                variable_values=dict(
+                                    name=node.name,
+                                    tenant=node.tenant,
+                                    messageType=message_type.name,
+                                    auditRecords=batch,
+                                ),
+                            )
                 except Exception:
                     getLogger().exception("Error creating audit records")
                 finally:
@@ -96,11 +93,12 @@ class _BulkDataStorageQueue(Queue):
             while True:
                 self.__fill.wait()
                 try:
-                    with node._gql_client as session:
-                        bulk_data_storages: list[dict] = session.execute(
-                            _GET_BULK_DATA_STORAGE_GQL,
-                            variable_values={"tenant": node.tenant},
-                        )["GetBulkDataStorage"]
+                    with node._lock:
+                        with node._gql_client as session:
+                            bulk_data_storages: list[dict] = session.execute(
+                                _GET_BULK_DATA_STORAGE_GQL,
+                                variable_values={"tenant": node.tenant},
+                            )["GetBulkDataStorage"]
                 except Exception:
                     getLogger().exception("Error getting bulk data storage")
                 else:
@@ -210,8 +208,13 @@ class Node(BaseNode):
         )
         self.__bulk_data_storage_queue = _BulkDataStorageQueue(self)
         self.__audit_records_queues: dict[str, _AuditRecordQueue] = dict()
+        self.__lock = RLock()
         self.__stop = Event()
         self.__target_message_queues: dict[str, _TargetMessageQueue] = dict()
+
+    @property
+    def _lock(self) -> RLock:
+        return self.__lock
 
     def audit_message(
         self,
@@ -270,11 +273,12 @@ class Node(BaseNode):
     def start(self) -> None:
         getLogger().info(f"Starting Node {self.name}")
         self.__stop.clear()
-        with self._gql_client as session:
-            data: dict[str, Union[str, dict]] = session.execute(
-                _GET_NODE_GQL,
-                variable_values=dict(name=self.name, tenant=self.tenant),
-            )["GetNode"]
+        with self._lock:
+            with self._gql_client as session:
+                data: dict[str, Union[str, dict]] = session.execute(
+                    _GET_NODE_GQL,
+                    variable_values=dict(name=self.name, tenant=self.tenant),
+                )["GetNode"]
         self.config = (
             json.loads(data["tenant"].get("config") or "{}")
             | json.loads((data.get("app") or dict()).get("config") or "{}")

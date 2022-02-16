@@ -4,7 +4,7 @@ import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from os import cpu_count, environ
-from threading import get_ident
+from threading import RLock
 from time import time
 from typing import TYPE_CHECKING, Any, Callable, Union
 from uuid import uuid4
@@ -244,15 +244,17 @@ class _NodeBotocoreSession(BotocoreSession):
         self, *, node: Node, gql_client: GqlClient, duration: int = None
     ) -> None:
         super().__init__()
+        lock = RLock()
 
         def refresher():
-            with gql_client as session:
-                credentials = session.execute(
-                    _GET_AWS_CREDENTIALS_GQL,
-                    variable_values=dict(
-                        name=node.app, tenant=node.tenant, duration=duration or 3600
-                    ),
-                )["GetApp"]["GetAwsCredentials"]
+            with lock:
+                with gql_client as session:
+                    credentials = session.execute(
+                        _GET_AWS_CREDENTIALS_GQL,
+                        variable_values=dict(
+                            name=node.app, tenant=node.tenant, duration=duration or 3600
+                        ),
+                    )["GetApp"]["GetAwsCredentials"]
             return dict(
                 access_key=credentials["accessKeyId"],
                 expiry_time=credentials["expiration"],
@@ -412,16 +414,13 @@ class Node(ABC):
         self.__app = data["app"]["name"]
         self.__app_type = data["app"]["__typename"]
         self.__config: dict[str, Any] = None
-        if gql_transport_cls == _CognitoRequestsHTTPTransport:
-            self.__gql_client = gql_client
-        else:
-            self.__gql_client = GqlClient(
-                fetch_schema_from_transport=True,
-                transport=gql_transport_cls(
-                    cognito,
-                    appsync_endpoint or environ["APPSYNC_ENDPOINT"],
-                ),
-            )
+        self.__gql_client = GqlClient(
+            fetch_schema_from_transport=True,
+            transport=gql_transport_cls(
+                cognito,
+                appsync_endpoint or environ["APPSYNC_ENDPOINT"],
+            ),
+        )
         self.__name = name
         self.__node_type = data["__typename"]
         self.__session = Session(
