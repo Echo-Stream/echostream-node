@@ -461,14 +461,17 @@ class AppNode(Node):
             username=username,
         )
         self.__source_message_receivers: list[_SourceMessageReceiver] = list()
+        self.__stop = Event()
 
     def join(self) -> None:
+        self.__stop.wait()
         for app_node_receiver in self.__source_message_receivers:
             app_node_receiver.join()
         super().join()
 
     def start(self) -> None:
         super().start()
+        self.__stop.clear()
         self.__source_message_receivers = [
             _SourceMessageReceiver(edge, self) for edge in self._sources
         ]
@@ -478,6 +481,7 @@ class AppNode(Node):
         self.join()
 
     def stop(self) -> None:
+        self.__stop.set()
         for app_node_receiver in self.__source_message_receivers:
             app_node_receiver.stop()
 
