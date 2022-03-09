@@ -24,9 +24,12 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         python -m pip install --upgrade setuptools wheel twine build virtualenv
+        python -m pip install -r requirements.dev.txt
+        python -m pip install pdoc
     - name: Build package
       run: |
         python -m build
+      if: ${{ false }}
     - name: Publish package
       env:
         TWINE_USERNAME: ${{ secrets.PYPI_USER }}
@@ -40,6 +43,5 @@ jobs:
         AWS_ACCESS_KEY_ID: ${{ secrets.CORP_PIPELINES_ACCESS_KEY }}
         AWS_SECRET_ACCESS_KEY: ${{ secrets.CORP_PIPELINES_SECRET_KEY }}
       run: |
-        pip install -r requirements.dev.txt && pip install pdoc
         pdoc echostream_node -o docs --footer-text "echostream-node `grep "version" setup.cfg | awk '{print $3}'`"
         aws s3 sync DOCS/ s3://docs-echostream-node-echo-stream/ --sse
