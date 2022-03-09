@@ -44,4 +44,4 @@ jobs:
         AWS_SECRET_ACCESS_KEY: ${{ secrets.CORP_PIPELINES_SECRET_KEY }}
       run: |
         pdoc echostream_node -o docs --footer-text "echostream-node `grep "version" setup.cfg | awk '{print $3}'`"
-        aws s3 sync DOCS/ s3://docs-echostream-node-echo-stream/ --sse
+        aws s3 sync docs/ s3://docs-echostream-node-echo-stream/ --sse
