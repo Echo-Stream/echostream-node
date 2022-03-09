@@ -33,6 +33,7 @@ jobs:
         TWINE_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
       run: |
         twine upload dist/*
+      if: ${{ false }}
     - name: Publish docs
       env:
         AWS_DEFAULT_REGION: "us-east-1"
