@@ -22,6 +22,9 @@ from pycognito import Cognito
 
 
 def getLogger() -> logging.Logger:
+    """
+    Returns "echostream-node" logger
+    """
     return logging.getLogger("echostream-node")
 
 
@@ -276,6 +279,9 @@ Auditor = Callable[..., dict[str, Any]]
 
 @dataclass(frozen=True, init=False)
 class BulkDataStorage:
+    """
+    Class to manage bulk data storage.
+    """
     presigned_get: str
     presigned_post: PresignedPost
 
@@ -293,11 +299,17 @@ class BulkDataStorage:
 
     @property
     def expired(self) -> bool:
+        """
+        Returns False if presigned_post is expired.
+        """
         return self.presigned_post.expiration < time()
 
 
 @dataclass(frozen=True)
 class Edge:
+    """
+    Edge dataclass to manage edge details.
+    """
     name: str
     queue: str
 
@@ -307,6 +319,10 @@ LambdaEvent = Union[bool, dict, float, int, list, str, tuple, None]
 
 @dataclass(frozen=True, init=False)
 class Message:
+    """
+    Message dataclass to manage message attributes and properties
+
+    """
     body: str
     group_id: str
     length: int
@@ -372,11 +388,17 @@ class Message:
 
 @dataclass(frozen=True)
 class MessageType:
+    """
+    Dataclass for messagetype
+    """
     auditor: Auditor
     name: str
 
 
 class Node(ABC):
+    """
+    Base level node class. Used by threading and asyncio modules to interact with echostream nodes.
+    """
     def __init__(
         self,
         *,
@@ -494,6 +516,14 @@ class Node(ABC):
         group_id: str = None,
         previous_tracking_ids: Union[list[str], str] = None,
     ) -> Message:
+        """
+        Creates message as per the message standard of echostream.
+
+        Arguments:
+        body - [POSITIONAL ARGUMENT] content of the message
+        group_id - [KEYWORD ARGUMENT] group id
+        previous_tracking_ids - [KEYWORD ARGUMENT] previous tracking id of the message if available
+        """
         return Message(
             body=body,
             group_id=group_id,
@@ -546,6 +576,9 @@ class Node(ABC):
 
 @dataclass(frozen=True)
 class PresignedPost:
+    """
+    Dataclass for presignedPost.
+    """
     expiration: int
     fields: dict[str, str]
     url: str

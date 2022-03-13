@@ -438,6 +438,10 @@ class _SourceMessageReceiver(Thread):
 
 
 class AppNode(Node):
+    """
+    Class to manage nodes inside the app.
+    Inherits the Node class.
+    """
     def __init__(
         self,
         *,
@@ -464,12 +468,18 @@ class AppNode(Node):
         self.__stop = Event()
 
     def join(self) -> None:
+        """
+        Method to join all the app node receivers so that main thread can wait for their execution to complete.
+        """
         self.__stop.wait()
         for app_node_receiver in self.__source_message_receivers:
             app_node_receiver.join()
         super().join()
 
     def start(self) -> None:
+        """
+        Calls start of Node class
+        """
         super().start()
         self.__stop.clear()
         self.__source_message_receivers = [
@@ -481,6 +491,9 @@ class AppNode(Node):
         self.join()
 
     def stop(self) -> None:
+        """
+        Stops the threads gracefully
+        """
         self.__stop.set()
         for app_node_receiver in self.__source_message_receivers:
             app_node_receiver.stop()
