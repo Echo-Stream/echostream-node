@@ -9,5 +9,6 @@ dynamic-function-loader
 gql[aiohttp,requests]>=3.0.0
 pycognito
 requests
+sequential-executor
 simplejson
 virtualenv

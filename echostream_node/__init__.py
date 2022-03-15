@@ -282,6 +282,7 @@ class BulkDataStorage:
     """
     Class to manage bulk data storage.
     """
+
     presigned_get: str
     presigned_post: PresignedPost
 
@@ -310,6 +311,7 @@ class Edge:
     """
     Edge dataclass to manage edge details.
     """
+
     name: str
     queue: str
 
@@ -323,6 +325,7 @@ class Message:
     Message dataclass to manage message attributes and properties
 
     """
+
     body: str
     group_id: str
     length: int
@@ -391,6 +394,7 @@ class MessageType:
     """
     Dataclass for messagetype
     """
+
     auditor: Auditor
     name: str
 
@@ -399,6 +403,7 @@ class Node(ABC):
     """
     Base level node class. Used by threading and asyncio modules to interact with echostream nodes.
     """
+
     def __init__(
         self,
         *,
@@ -579,6 +584,7 @@ class PresignedPost:
     """
     Dataclass for presignedPost.
     """
+
     expiration: int
     fields: dict[str, str]
     url: str
