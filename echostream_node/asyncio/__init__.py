@@ -153,6 +153,18 @@ class _BulkDataStorageQueue(asyncio.Queue):
         return bulk_data_storage if not bulk_data_storage.expired else await self.get()
 
 
+class _CognitoAIOHTTPTransport(AIOHTTPTransport):
+    def __init__(self, cognito: Cognito, url: str, **kwargs: Any) -> None:
+        self._cognito = cognito
+        super().__init__(url, **kwargs)
+
+    def __getattribute__(self, name: str) -> Any:
+        if name == "headers":
+            self._cognito.check_token()
+            return dict(Authorization=self._cognito.access_token)
+        return super().__getattribute__(name)
+
+
 class _DeleteMessageQueue(asyncio.Queue):
     def __init__(self, edge: Edge, node: Node) -> None:
         super().__init__()
@@ -384,19 +396,13 @@ class _TargetMessageQueue(asyncio.Queue):
         return await super().get()
 
 
-class CognitoAIOHTTPTransport(AIOHTTPTransport):
-    def __init__(self, cognito: Cognito, url: str, **kwargs: Any) -> None:
-        self._cognito = cognito
-        super().__init__(url, **kwargs)
-
-    def __getattribute__(self, name: str) -> Any:
-        if name == "headers":
-            self._cognito.check_token()
-            return dict(Authorization=self._cognito.access_token)
-        return super().__getattribute__(name)
-
-
 class Node(BaseNode):
+    """
+    Base class for all implemented asyncio Nodes.
+
+    Nodes of this class must be instantiated outside of
+    the asyncio event loop.
+    """
     def __init__(
         self,
         *,
@@ -413,7 +419,7 @@ class Node(BaseNode):
         super().__init__(
             appsync_endpoint=appsync_endpoint,
             client_id=client_id,
-            gql_transport_cls=CognitoAIOHTTPTransport,
+            gql_transport_cls=_CognitoAIOHTTPTransport,
             name=name,
             password=password,
             tenant=tenant,
@@ -444,6 +450,12 @@ class Node(BaseNode):
         extra_attributes: dict[str, Any] = None,
         source: str = None,
     ) -> None:
+        """
+        Audits the provided message. If extra_attibutes is
+        supplied, they will be added to the message's audit
+        dict. If source is provided, it will be recorded in
+        the audit.
+        """
         extra_attributes = extra_attributes or dict()
         message_type = message.message_type
         record = dict(
@@ -462,12 +474,25 @@ class Node(BaseNode):
             raise ValueError(f"Unrecognized message type {message_type.name}")
 
     async def handle_bulk_data(self, data: Union[bytearray, bytes]) -> str:
+        """
+        Posts data as bulk data and returns a GET URL for data retrieval.
+        Normally this returned URL will be used as a "ticket" in messages
+        that require bulk data.
+        """
         return await (await self.__bulk_data_storage_queue.get()).handle_bulk_data(data)
 
     async def handle_received_message(self, *, message: Message, source: str) -> None:
+        """
+        Callback called when a message is received. Subclasses that receive messages
+        should override this method.
+        """
         pass
 
     async def join(self) -> None:
+        """
+        Joins the calling thread with this Node. Will block until all
+        join conditions are satified.
+        """
         await asyncio.gather(
             *[
                 source_message_receiver.join()
@@ -484,11 +509,19 @@ class Node(BaseNode):
             await audit_records_queue.join()
 
     def send_message(self, /, message: Message, *, targets: set[Edge] = None) -> None:
+        """
+        Send the message to the specified targets. If no targets are specified
+        the message will be sent to all targets.
+        """
         self.send_messages([message], targets=targets)
 
     def send_messages(
         self, /, messages: list[Message], *, targets: set[Edge] = None
     ) -> None:
+        """
+        Send the messages to the specified targets. If no targets are specified
+        the messages will be sent to all targets.
+        """
         if messages:
             for target in targets or self.targets:
                 if target_message_queue := self.__target_message_queues.get(
@@ -500,6 +533,9 @@ class Node(BaseNode):
                     getLogger().warning(f"Target {target.name} does not exist")
 
     async def start(self) -> None:
+        """
+        Starts this Node. Must be called prior to any other usage.
+        """
         getLogger().info(f"Starting Node {self.name}")
         self.__lock = asyncio.Lock()
         self.__bulk_data_storage_queue = _BulkDataStorageQueue(self)
@@ -554,5 +590,6 @@ class Node(BaseNode):
         ]
 
     async def start_and_run_forever(self) -> None:
+        """Will start this Node and run until the containing Task is cancelled"""
         await self.start()
         await self.join()

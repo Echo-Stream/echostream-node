@@ -186,6 +186,10 @@ class _TargetMessageQueue(Queue):
 
 
 class Node(BaseNode):
+    """
+    Base class for all threading Nodes.
+    """
+
     def __init__(
         self,
         *,
@@ -225,6 +229,12 @@ class Node(BaseNode):
         extra_attributes: dict[str, Any] = None,
         source: str = None,
     ) -> None:
+        """
+        Audits the provided message. If extra_attibutes is
+        supplied, they will be added to the message's audit
+        dict. If source is provided, it will be recorded in
+        the audit.
+        """
         extra_attributes = extra_attributes or dict()
         message_type = message.message_type
         record = dict(
@@ -243,23 +253,44 @@ class Node(BaseNode):
             raise ValueError(f"Unrecognized message type {message_type.name}")
 
     def handle_bulk_data(self, data: Union[bytearray, bytes]) -> str:
+        """
+        Posts data as bulk data and returns a GET URL for data retrieval.
+        Normally this returned URL will be used as a "ticket" in messages
+        that require bulk data.
+        """
         return self.__bulk_data_storage_queue.get().handle_bulk_data(data)
 
     def handle_received_message(self, *, message: Message, source: str) -> None:
+        """
+        Callback called when a message is received. Subclasses that receive messages
+        should override this method.
+        """
         pass
 
     def join(self) -> None:
+        """
+        Joins the calling thread with this Node. Will block until all
+        join conditions are satified.
+        """
         for target_message_queue in self.__target_message_queues.values():
             target_message_queue.join()
         for audit_records_queue in self.__audit_records_queues.values():
             audit_records_queue.join()
 
     def send_message(self, /, message: Message, *, targets: set[Edge] = None) -> None:
+        """
+        Send the message to the specified targets. If no targets are specified
+        the message will be sent to all targets.
+        """
         self.send_messages([message], targets=targets)
 
     def send_messages(
         self, /, messages: list[Message], *, targets: set[Edge] = None
     ) -> None:
+        """
+        Send the messages to the specified targets. If no targets are specified
+        the messages will be sent to all targets.
+        """
         if messages:
             for target in targets or self.targets:
                 if target_message_queue := self.__target_message_queues.get(
@@ -271,6 +302,9 @@ class Node(BaseNode):
                     getLogger().warning(f"Target {target.name} does not exist")
 
     def start(self) -> None:
+        """
+        Starts this Node. Must be called prior to any other usage.
+        """
         getLogger().info(f"Starting Node {self.name}")
         with self._lock:
             with self._gql_client as session:
@@ -318,6 +352,7 @@ class Node(BaseNode):
         }
 
     def stop(self) -> None:
+        """Stops the Node's processing."""
         pass
 
 
@@ -450,8 +485,8 @@ class _SourceMessageReceiver(Thread):
 
 class AppNode(Node):
     """
-    Class to manage nodes inside the app.
-    Inherits the Node class.
+    A daemon Node intended to be used as either a stand-alone application
+    or as a part of a larger application.
     """
 
     def __init__(
@@ -505,12 +540,13 @@ class AppNode(Node):
         ]
 
     def start_and_run_forever(self) -> None:
+        """Will start this Node and run until stop is called"""
         self.start()
         self.join()
 
     def stop(self) -> None:
         """
-        Stops the threads gracefully
+        Stops the Node gracefully
         """
         self.__stop.set()
         for app_node_receiver in self.__source_message_receivers:
@@ -518,6 +554,11 @@ class AppNode(Node):
 
 
 class LambdaNode(Node):
+    """
+    A Node class intended to be implemented in an AWS Lambda function.
+    Nodes that inherit from this class are automatically started on
+    creation.
+    """
     def __init__(
         self,
         *,
@@ -555,6 +596,13 @@ class LambdaNode(Node):
         return self.__queue_name_to_source[queue_arn.split(":")[-1:][0]]
 
     def handle_event(self, event: LambdaEvent) -> None:
+        """
+        Handles the AWS Lambda event passed into the containing
+        AWS Lambda function during invocation.
+
+        This is intended to be the only called method in your
+        containing AWS Lambda function.
+        """
         records: list[
             dict[
                 str,

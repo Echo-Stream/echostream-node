@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from abc import ABC, abstractmethod
+from abc import ABC
 from dataclasses import dataclass
 from os import cpu_count, environ
 from threading import RLock
@@ -275,7 +275,7 @@ class _NodeBotocoreSession(BotocoreSession):
 
 
 Auditor = Callable[..., dict[str, Any]]
-
+"""Typing for MessageType auditor functions"""
 
 @dataclass(frozen=True, init=False)
 class BulkDataStorage:
@@ -284,7 +284,9 @@ class BulkDataStorage:
     """
 
     presigned_get: str
+    """URL that you can HTTP 'GET' to retrieve the bulk data"""
     presigned_post: PresignedPost
+    """URL that you can HTTP 'POST' bulk data to, along with the fields the 'POST' requires"""
 
     def __init__(self, bulk_data_storage: dict[str, Union[str, PresignedPost]]) -> None:
         super().__init__()
@@ -313,26 +315,34 @@ class Edge:
     """
 
     name: str
+    """The name of the Edge, normally the other end of the Edge"""
     queue: str
+    """The SQS Queue URL of the Edge"""
 
 
 LambdaEvent = Union[bool, dict, float, int, list, str, tuple, None]
-
+"""Typing for the various types that a Lambda can be invoked with"""
 
 @dataclass(frozen=True, init=False)
 class Message:
     """
     Message dataclass to manage message attributes and properties
-
     """
 
     body: str
+    """The body"""
     group_id: str
+    """The SQS group id"""
     length: int
+    """The length, as SQS calculates it"""
     message_attributes: dict[str, MessageAttributeValueTypeDef]
+    """The user-defined attributes"""
     message_type: MessageType
+    """The EchoStream message type"""
     tracking_id: str
+    """The tracking id"""
     previous_tracking_ids: list[str]
+    """A list of previous tracking ids. Populated if the original message was split"""
 
     def __init__(
         self,
@@ -396,7 +406,9 @@ class MessageType:
     """
 
     auditor: Auditor
+    """The auditor"""
     name: str
+    """The name"""
 
 
 class Node(ABC):
@@ -582,9 +594,13 @@ class Node(ABC):
 @dataclass(frozen=True)
 class PresignedPost:
     """
-    Dataclass for presignedPost.
+    PresignedPost objects are part of the Bulk Data Storage system
+    and are used to POST bulk data.
     """
 
     expiration: int
+    """Epoch, in seconds, when this expires"""
     fields: dict[str, str]
+    """The fields required to be sent when POSTing bulk data"""
     url: str
+    """The POST url used to POST bulk data"""
