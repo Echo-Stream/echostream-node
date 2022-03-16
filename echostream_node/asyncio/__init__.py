@@ -223,9 +223,24 @@ class _SourceMessageReceiver:
     def __init__(self, edge: Edge, node: Node) -> None:
         self.__delete_message_queue = _DeleteMessageQueue(edge, node)
 
+        async def handle_received_message(
+            message: Message, receipt_handle: str
+        ) -> bool:
+            try:
+                await node.handle_received_message(message=message, source=edge.name)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                getLogger().exception(
+                    f"Error handling recevied message for {edge.name}"
+                )
+                return False
+            else:
+                self.__delete_message_queue.put_nowait(receipt_handle)
+            return True
+
         async def receive() -> None:
             getLogger().info(f"Receiving messages from {edge.name}")
-            error_count = 0
             while True:
                 try:
                     response = await asyncio.get_running_loop().run_in_executor(
@@ -239,53 +254,45 @@ class _SourceMessageReceiver:
                             WaitTimeSeconds=20,
                         ),
                     )
-                    error_count = 0
                 except asyncio.CancelledError:
                     raise
                 except catch_aws_error("AWS.SimpleQueueService.NonExistentQueue"):
                     getLogger().warning(f"Queue {edge.queue} does not exist, exiting")
                     break
                 except Exception:
-                    error_count += 1
-                    if error_count == 10:
-                        getLogger().critical(
-                            f"Recevied 10 errors in a row trying to receive from {edge.queue}, exiting"
-                        )
-                        raise
-                    else:
-                        getLogger().exception(
-                            f"Error receiving messages from {edge.name}, retrying"
-                        )
-                        await asyncio.sleep(10)
+                    getLogger().exception(
+                        f"Error receiving messages from {edge.name}, retrying"
+                    )
+                    await asyncio.sleep(20)
                 else:
                     if not (sqs_messages := response.get("Messages")):
                         continue
                     getLogger().info(f"Received {len(sqs_messages)} from {edge.name}")
-                    for sqs_message in sqs_messages:
-                        message = Message(
-                            body=sqs_message["Body"],
-                            group_id=sqs_message["Attributes"]["MessageGroupId"],
-                            message_type=node.receive_message_type,
-                            tracking_id=sqs_message["MessageAttributes"]
-                            .get("trackingId", {})
-                            .get("StringValue"),
-                            previous_tracking_ids=sqs_message["MessageAttributes"]
-                            .get("prevTrackingIds", {})
-                            .get("StringValue"),
+
+                    handle_received_messages = [
+                        handle_received_message(
+                            Message(
+                                body=sqs_message["Body"],
+                                group_id=sqs_message["Attributes"]["MessageGroupId"],
+                                message_type=node.receive_message_type,
+                                tracking_id=sqs_message["MessageAttributes"]
+                                .get("trackingId", {})
+                                .get("StringValue"),
+                                previous_tracking_ids=sqs_message["MessageAttributes"]
+                                .get("prevTrackingIds", {})
+                                .get("StringValue"),
+                            ),
+                            sqs_message["ReceiptHandle"],
                         )
-                        receipt_handle = sqs_message["ReceiptHandle"]
-                        try:
-                            await node.handle_received_message(
-                                message=message, source=edge.name
-                            )
-                        except asyncio.CancelledError:
-                            raise
-                        except Exception:
-                            getLogger().exception(
-                                f"Error handling recevied message for {edge.name}"
-                            )
-                        else:
-                            self.__delete_message_queue.put_nowait(receipt_handle)
+                        for sqs_message in sqs_messages
+                    ]
+                    if node._concurrent_processing:
+                        await asyncio.gather(*handle_received_messages)
+                    else:
+                        for coro in handle_received_messages:
+                            if not await coro:
+                                break
+
             getLogger().info(f"Stopping receiving messages from {edge.name}")
 
         self.__task = asyncio.create_task(
@@ -395,6 +402,7 @@ class Node(BaseNode):
         *,
         appsync_endpoint: str = None,
         client_id: str = None,
+        concurrent_processing: bool = False,
         name: str = None,
         password: str = None,
         tenant: str = None,
@@ -416,8 +424,13 @@ class Node(BaseNode):
         self.__audit_records_queues: dict[str, _AuditRecordQueue] = dict()
         self.__bulk_data_storage_queue: _BulkDataStorageQueue = None
         self.__lock: asyncio.Lock = None
+        self.__concurrent_processing = concurrent_processing
         self.__source_message_receivers: list[_SourceMessageReceiver] = list()
         self.__target_message_queues: dict[str, _TargetMessageQueue] = dict()
+
+    @property
+    def _concurrent_processing(self) -> bool:
+        return self.__concurrent_processing
 
     @property
     def _lock(self) -> asyncio.Lock:

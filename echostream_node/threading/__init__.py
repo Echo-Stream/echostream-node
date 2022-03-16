@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import Executor, ThreadPoolExecutor, as_completed, wait
 from datetime import datetime, timezone
+from functools import partial
 from gzip import GzipFile
 from io import BytesIO
 from queue import Empty, Queue
@@ -363,15 +365,26 @@ class _DeleteMessageQueue(Queue):
 
 
 class _SourceMessageReceiver(Thread):
-    def __init__(self, edge: Edge, node: Node) -> None:
+    def __init__(self, edge: Edge, node: AppNode) -> None:
         self.__continue = Event()
         self.__continue.set()
         self.__delete_message_queue = _DeleteMessageQueue(edge, node)
 
+        def handle_received_message(message: Message, receipt_handle: str) -> bool:
+            try:
+                node.handle_received_message(message=message, source=edge.name)
+            except Exception:
+                getLogger().exception(
+                    f"Error handling recevied message for {edge.name}"
+                )
+                return False
+            else:
+                self.__delete_message_queue.put_nowait(receipt_handle)
+            return True
+
         def receive() -> None:
             self.__continue.wait()
             getLogger().info(f"Receiving messages from {edge.name}")
-            error_count = 0
             while self.__continue.is_set():
                 try:
                     response = node._sqs_client.receive_message(
@@ -381,49 +394,47 @@ class _SourceMessageReceiver(Thread):
                         QueueUrl=edge.queue,
                         WaitTimeSeconds=20,
                     )
-                    error_count = 0
                 except catch_aws_error("AWS.SimpleQueueService.NonExistentQueue"):
                     getLogger().warning(f"Queue {edge.queue} does not exist, exiting")
                     break
                 except Exception:
-                    error_count += 1
-                    if error_count == 10:
-                        getLogger().critical(
-                            f"Recevied 10 errors in a row trying to receive from {edge.queue}, exiting"
-                        )
-                        raise
-                    else:
-                        getLogger().exception(
-                            f"Error receiving messages from {edge.name}, retrying"
-                        )
-                        sleep(10)
+                    getLogger().exception(
+                        f"Error receiving messages from {edge.name}, retrying"
+                    )
+                    sleep(20)
                 else:
                     if not (sqs_messages := response.get("Messages")):
                         continue
                     getLogger().info(f"Received {len(sqs_messages)} from {edge.name}")
-                    for sqs_message in sqs_messages:
-                        message = Message(
-                            body=sqs_message["Body"],
-                            group_id=sqs_message["Attributes"]["MessageGroupId"],
-                            message_type=node.receive_message_type,
-                            tracking_id=sqs_message["MessageAttributes"]
-                            .get("trackingId", {})
-                            .get("StringValue"),
-                            previous_tracking_ids=sqs_message["MessageAttributes"]
-                            .get("prevTrackingIds", {})
-                            .get("StringValue"),
+
+                    handle_received_messages = [
+                        partial(
+                            handle_received_message,
+                            Message(
+                                body=sqs_message["Body"],
+                                group_id=sqs_message["Attributes"]["MessageGroupId"],
+                                message_type=node.receive_message_type,
+                                tracking_id=sqs_message["MessageAttributes"]
+                                .get("trackingId", {})
+                                .get("StringValue"),
+                                previous_tracking_ids=sqs_message["MessageAttributes"]
+                                .get("prevTrackingIds", {})
+                                .get("StringValue"),
+                            ),
+                            sqs_message["ReceiptHandle"],
                         )
-                        receipt_handle = sqs_message["ReceiptHandle"]
-                        try:
-                            node.handle_received_message(
-                                message=message, source=edge.name
-                            )
-                        except Exception:
-                            getLogger().exception(
-                                f"Error handling recevied message for {edge.name}"
-                            )
-                        else:
-                            self.__delete_message_queue.put_nowait(receipt_handle)
+                        for sqs_message in sqs_messages
+                    ]
+
+                    if executor := node._executor:
+                        wait(
+                            [executor.submit(func) for func in handle_received_messages]
+                        )
+                    else:
+                        for func in handle_received_messages:
+                            if not func():
+                                break
+
             getLogger().info(f"Stopping receiving messages from {edge.name}")
 
         super().__init__(name=f"SourceMessageReceiver({edge.name})", target=receive)
@@ -442,11 +453,13 @@ class AppNode(Node):
     Class to manage nodes inside the app.
     Inherits the Node class.
     """
+
     def __init__(
         self,
         *,
         appsync_endpoint: str = None,
         client_id: str = None,
+        executor: Executor = None,
         name: str = None,
         password: str = None,
         tenant: str = None,
@@ -464,8 +477,13 @@ class AppNode(Node):
             user_pool_id=user_pool_id,
             username=username,
         )
+        self.__executor = executor
         self.__source_message_receivers: list[_SourceMessageReceiver] = list()
         self.__stop = Event()
+
+    @property
+    def _executor(self) -> Executor:
+        return self.__executor
 
     def join(self) -> None:
         """
@@ -505,8 +523,10 @@ class LambdaNode(Node):
         *,
         appsync_endpoint: str = None,
         client_id: str = None,
+        concurrent_processing: bool = False,
         name: str = None,
         password: str = None,
+        report_batch_item_failures: bool = False,
         tenant: str = None,
         timeout: float = None,
         user_pool_id: str = None,
@@ -523,9 +543,13 @@ class LambdaNode(Node):
             username=username,
         )
         self.start()
+        self.__executor: Executor = (
+            ThreadPoolExecutor() if concurrent_processing else None
+        )
         self.__queue_name_to_source = {
             edge.queue.split("/")[-1:][0]: edge.name for edge in self._sources
         }
+        self.__report_batch_item_failures = report_batch_item_failures
 
     def _get_source(self, queue_arn: str) -> str:
         return self.__queue_name_to_source[queue_arn.split(":")[-1:][0]]
@@ -547,13 +571,30 @@ class LambdaNode(Node):
         if not (records := event.get("Records")):
             getLogger().warning(f"No Records found in event {event}")
             return
-        source: str = None
-        try:
-            for record in records:
-                if not source:
-                    source = self._get_source(record["eventSourceARN"])
-                    getLogger().info(f"Received {len(records)} messages from {source}")
-                message = Message(
+
+        source = self._get_source(records[0]["eventSourceARN"])
+        getLogger().info(f"Received {len(records)} messages from {source}")
+        batch_item_failures: list[str] = (
+            [record["messageId"] for record in records]
+            if self.__report_batch_item_failures
+            else None
+        )
+
+        def handle_received_message(message: Message, message_id: str) -> None:
+            try:
+                self.handle_received_message(message=message, source=source)
+            except Exception:
+                if not self.__report_batch_item_failures:
+                    raise
+                getLogger().exception(f"Error handling recevied message for {source}")
+            else:
+                if self.__report_batch_item_failures:
+                    batch_item_failures.remove(message_id)
+
+        handle_received_messages = [
+            partial(
+                handle_received_message,
+                Message(
                     body=record["body"],
                     group_id=record["attributes"]["MessageGroupId"],
                     message_type=self.receive_message_type,
@@ -564,7 +605,28 @@ class LambdaNode(Node):
                     .get("trackingId", {})
                     .get("stringValue")
                     or uuid4().hex,
-                )
-                self.handle_received_message(message=message, source=source)
+                ),
+                record["messageId"],
+            )
+            for record in records
+        ]
+
+        try:
+            if executor := self.__executor:
+                for future in as_completed(
+                    [executor.submit(func) for func in handle_received_messages]
+                ):
+                    if exception := future.exception():
+                        raise exception
+            else:
+                for func in handle_received_messages:
+                    func()
         finally:
             self.join()
+        if self.__report_batch_item_failures and batch_item_failures:
+            return dict(
+                batchItemFailures=[
+                    dict(itemIdentifier=message_id)
+                    for message_id in batch_item_failures
+                ]
+            )

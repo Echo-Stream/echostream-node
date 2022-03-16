@@ -100,3 +100,127 @@ MY_EXTERNAL_NODE = MyExternalNode()
 def lambda_handler(event, context):
     MY_EXTERNAL_NODE.handle_event(event)
 ```
+
+## Concurrent vs Sequential Message Processing
+By default, all Nodes created using the package will process messages sequentially.
+This is normally the behavior that you want, as many messaging protocols require
+guaranteed ordering and therefore sequential processing within your Nodes. If this is
+the behavior that you require, nothign special is needed to gain it from `echostream-node`.
+
+However, there are use cases where message ordering is not important but processing speed is.
+In these cases, you may configure your Node upon creation to concurrently process the messages
+that it receives.
+
+### Making a Threading Application Node Concurrent
+If your Node inherits from the `echostream_node.threading.AppNode` class you can achieve concurrency
+using either threading or multi-processing. The former is appropriate if your processing is IO bound
+or your execution platform does not support shared memory (required for multi-processing). The latter
+is appropriate if your platform supports shared memory *and* your processing is CPU bound.
+
+#### Creating A Concurrent Application Node Using Threading
+
+This will create an AppNode that uses the provided `ThreadPoolExecutor` to concurrently
+process received `Message`s. Note that while you can set the maximum number of workers to
+less than 10, there is no gain to setting it to more than 10 since Nodes will only process
+up to 10 messages at a time.
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+
+from echostream_node import Message
+from echostream_node.threading import AppNode
+
+class MyExternalNode(AppNode):
+
+    def __init__(self) -> None:
+        super().__init__(executor=ThreadPoolExecutor(max_workers=10))
+
+    def handle_received_message(self, *, message: Message, source: str) -> None:
+        print(f"Got a message:\n{message.body}")
+        self.audit_message(message, source=source)
+```
+
+#### Creating A Concurrent Application Node Using Multi-Processing
+
+This will create an AppNode that uses the provided `ProcessPoolExecutor` to concurrently
+process received `Message`s. Note that while you can set the maximum number of workers to
+less than 10, there is no gain to setting it to more than 10 since Nodes will only process
+up to 10 messages at a time.
+
+```python
+from concurrent.futures import ProcessPoolExecutor
+
+from echostream_node import Message
+from echostream_node.threading import AppNode
+
+class MyExternalNode(AppNode):
+
+    def __init__(self) -> None:
+        super().__init__(executor=ProcessPoolExecutor(max_workers=10))
+
+    def handle_received_message(self, *, message: Message, source: str) -> None:
+        print(f"Got a message:\n{message.body}")
+        self.audit_message(message, source=source)
+```
+### Making a Asyncio Application Node Concurrent
+If your Node inherits from the `echostream_node.asyncio.Node` you can set the Node to
+process incoming `Message`s concurrently. There is no setting for the maximum number of tasks;
+a task is created per received `Message`.
+
+```python
+import asyncio
+
+from echostream_node import Message
+from echostream_node.asyncio import Node
+
+class MyExternalNode(Node):
+
+    def __init__(self) -> None:
+        super().__init__(concurrent_processing=True)
+
+    async def handle_received_message(self, *, message: Message, source: str) -> None:
+        print(f"Got a message:\n{message.body}")
+        self.audit_message(message, source=source)
+```
+
+### Making a Lambda Node Concurrent
+The AWS Lambda platform does not support shared memory, and therefore will only support concurrency
+via threading. This will create a LambdaNode that uses an optimized (to your Lambda function's resources)
+`ThreadPoolExecutor` to concurrently process received `Message`s.
+
+```python
+from echostream_node import Message
+from echostream_node.threading import LambdaNode
+
+class MyExternalNode(LambdaNode):
+
+    def __init__(self) -> None:
+        super().__init__(concurrent_processing=True)
+
+    def handle_received_message(self, *, message: Message, source: str) -> None:
+        print(f"Got a message:\n{message.body}")
+        self.audit_message(message, source=source)
+```
+
+## Lambda Nodes and Partial Success Reporting
+When you connect an Edge's SQS Queue to the AWS Lambda function implementing your
+Lambda Node, you can choose to Report Batch Item Failures. This allows your Lambda Node
+to report partial success back to the SQS Queue, but it does require that your Lambda Node
+operate differently.
+
+If you wish to take advantage of this, set `report_batch_item_failures` when you create your
+Lambda Node. This can be set even if your Node is *not* concurrent processing.
+
+```python
+from echostream_node import Message
+from echostream_node.threading import LambdaNode
+
+class MyExternalNode(LambdaNode):
+
+    def __init__(self) -> None:
+        super().__init__(report_batch_item_failures=True)
+
+    def handle_received_message(self, *, message: Message, source: str) -> None:
+        print(f"Got a message:\n{message.body}")
+        self.audit_message(message, source=source)
+```
