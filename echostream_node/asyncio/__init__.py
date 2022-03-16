@@ -153,18 +153,6 @@ class _BulkDataStorageQueue(asyncio.Queue):
         return bulk_data_storage if not bulk_data_storage.expired else await self.get()
 
 
-class _CognitoAIOHTTPTransport(AIOHTTPTransport):
-    def __init__(self, cognito: Cognito, url: str, **kwargs: Any) -> None:
-        self._cognito = cognito
-        super().__init__(url, **kwargs)
-
-    def __getattribute__(self, name: str) -> Any:
-        if name == "headers":
-            self._cognito.check_token()
-            return dict(Authorization=self._cognito.access_token)
-        return super().__getattribute__(name)
-
-
 class _DeleteMessageQueue(asyncio.Queue):
     def __init__(self, edge: Edge, node: Node) -> None:
         super().__init__()
@@ -396,6 +384,18 @@ class _TargetMessageQueue(asyncio.Queue):
         return await super().get()
 
 
+class CognitoAIOHTTPTransport(AIOHTTPTransport):
+    def __init__(self, cognito: Cognito, url: str, **kwargs: Any) -> None:
+        self._cognito = cognito
+        super().__init__(url, **kwargs)
+
+    def __getattribute__(self, name: str) -> Any:
+        if name == "headers":
+            self._cognito.check_token()
+            return dict(Authorization=self._cognito.access_token)
+        return super().__getattribute__(name)
+
+
 class Node(BaseNode):
     """
     Base class for all implemented asyncio Nodes.
@@ -403,6 +403,7 @@ class Node(BaseNode):
     Nodes of this class must be instantiated outside of
     the asyncio event loop.
     """
+
     def __init__(
         self,
         *,
@@ -419,7 +420,7 @@ class Node(BaseNode):
         super().__init__(
             appsync_endpoint=appsync_endpoint,
             client_id=client_id,
-            gql_transport_cls=_CognitoAIOHTTPTransport,
+            gql_transport_cls=CognitoAIOHTTPTransport,
             name=name,
             password=password,
             tenant=tenant,

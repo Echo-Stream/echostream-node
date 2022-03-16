@@ -230,18 +230,6 @@ _GET_NODE_GQL = gql(
 )
 
 
-class _CognitoRequestsHTTPTransport(RequestsHTTPTransport):
-    def __init__(self, cognito: Cognito, url: str, **kwargs: Any) -> None:
-        self._cognito = cognito
-        super().__init__(url, **kwargs)
-
-    def __getattribute__(self, name: str) -> Any:
-        if name == "headers":
-            self._cognito.check_token()
-            return dict(Authorization=self._cognito.access_token)
-        return super().__getattribute__(name)
-
-
 class _NodeBotocoreSession(BotocoreSession):
     def __init__(
         self, *, node: Node, gql_client: GqlClient, duration: int = None
@@ -277,6 +265,7 @@ class _NodeBotocoreSession(BotocoreSession):
 Auditor = Callable[..., dict[str, Any]]
 """Typing for MessageType auditor functions"""
 
+
 @dataclass(frozen=True, init=False)
 class BulkDataStorage:
     """
@@ -308,6 +297,18 @@ class BulkDataStorage:
         return self.presigned_post.expiration < time()
 
 
+class CognitoRequestsHTTPTransport(RequestsHTTPTransport):
+    def __init__(self, cognito: Cognito, url: str, **kwargs: Any) -> None:
+        self._cognito = cognito
+        super().__init__(url, **kwargs)
+
+    def __getattribute__(self, name: str) -> Any:
+        if name == "headers":
+            self._cognito.check_token()
+            return dict(Authorization=self._cognito.access_token)
+        return super().__getattribute__(name)
+
+
 @dataclass(frozen=True)
 class Edge:
     """
@@ -322,6 +323,7 @@ class Edge:
 
 LambdaEvent = Union[bool, dict, float, int, list, str, tuple, None]
 """Typing for the various types that a Lambda can be invoked with"""
+
 
 @dataclass(frozen=True, init=False)
 class Message:
@@ -421,7 +423,7 @@ class Node(ABC):
         *,
         appsync_endpoint: str = None,
         client_id: str = None,
-        gql_transport_cls: type = _CognitoRequestsHTTPTransport,
+        gql_transport_cls: type = CognitoRequestsHTTPTransport,
         name: str = None,
         password: str = None,
         tenant: str = None,
@@ -440,7 +442,7 @@ class Node(ABC):
         tenant = tenant or environ["TENANT"]
         gql_client = GqlClient(
             fetch_schema_from_transport=True,
-            transport=_CognitoRequestsHTTPTransport(
+            transport=CognitoRequestsHTTPTransport(
                 cognito,
                 appsync_endpoint or environ["APPSYNC_ENDPOINT"],
             ),

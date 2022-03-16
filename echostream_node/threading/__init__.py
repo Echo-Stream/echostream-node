@@ -559,6 +559,7 @@ class LambdaNode(Node):
     Nodes that inherit from this class are automatically started on
     creation.
     """
+
     def __init__(
         self,
         *,
