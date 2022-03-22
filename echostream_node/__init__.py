@@ -137,12 +137,13 @@ _GET_BULK_DATA_STORAGE_GQL = gql(
     """
     query getBulkDataStorage($tenant: String!) {
         GetBulkDataStorage(tenant: $tenant, contentEncoding: gzip, count: 20) {
+            expiration
             presignedGet
             presignedPost {
-                expiration
                 fields
                 url
             }
+            presignedPut
         }
     }
     """
@@ -271,30 +272,34 @@ class BulkDataStorage:
     """
     Class to manage bulk data storage.
     """
-
+    expiration: int
+    """Epoch, in seconds, when this expires"""
     presigned_get: str
     """URL that you can HTTP 'GET' to retrieve the bulk data"""
     presigned_post: PresignedPost
     """URL that you can HTTP 'POST' bulk data to, along with the fields the 'POST' requires"""
+    presigned_put: str
+    """URL that you can HTTP 'PUT' bulk data to"""
 
     def __init__(self, bulk_data_storage: dict[str, Union[str, PresignedPost]]) -> None:
         super().__init__()
+        super().__setattr__("expiration", bulk_data_storage["expiration"])
         super().__setattr__("presigned_get", bulk_data_storage["presignedGet"])
         super().__setattr__(
             "presigned_post",
             PresignedPost(
-                expiration=bulk_data_storage["presignedPost"]["expiration"],
                 fields=json.loads(bulk_data_storage["presignedPost"]["fields"]),
                 url=bulk_data_storage["presignedPost"]["url"],
             ),
         )
+        super().__setattr__("presigned_put", bulk_data_storage["presignedPut"])
 
     @property
     def expired(self) -> bool:
         """
         Returns False if presigned_post is expired.
         """
-        return self.presigned_post.expiration < time()
+        return self.expiration < time()
 
 
 class CognitoRequestsHTTPTransport(RequestsHTTPTransport):
@@ -600,8 +605,6 @@ class PresignedPost:
     and are used to POST bulk data.
     """
 
-    expiration: int
-    """Epoch, in seconds, when this expires"""
     fields: dict[str, str]
     """The fields required to be sent when POSTing bulk data"""
     url: str
