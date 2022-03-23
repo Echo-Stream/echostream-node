@@ -143,7 +143,10 @@ _GET_BULK_DATA_STORAGE_GQL = gql(
                 fields
                 url
             }
-            presignedPut
+            presignedPut {
+                headers
+                url
+            }
         }
     }
     """
@@ -279,8 +282,8 @@ class BulkDataStorage:
     """URL that you can HTTP 'GET' to retrieve the bulk data"""
     presigned_post: PresignedPost
     """URL that you can HTTP 'POST' bulk data to, along with the fields the 'POST' requires"""
-    presigned_put: str
-    """URL that you can HTTP 'PUT' bulk data to"""
+    presigned_put: PresignedPut
+    """URL that you can HTTP 'PUT' bulk data to, along with the headers the 'PUT' requires"""
 
     def __init__(self, bulk_data_storage: dict[str, Union[str, PresignedPost]]) -> None:
         super().__init__()
@@ -293,7 +296,13 @@ class BulkDataStorage:
                 url=bulk_data_storage["presignedPost"]["url"],
             ),
         )
-        super().__setattr__("presigned_put", bulk_data_storage["presignedPut"])
+        super().__setattr__(
+            "presigned_put",
+            PresignedPut(
+                headers=json.loads(bulk_data_storage["presignedPut"]["headers"]),
+                url=bulk_data_storage["presignedPut"]["url"],
+            ),
+        )
 
     @property
     def expired(self) -> bool:
@@ -612,3 +621,16 @@ class PresignedPost:
     """The fields required to be sent when POSTing bulk data"""
     url: str
     """The POST url used to POST bulk data"""
+
+
+@dataclass(frozen=True)
+class PresignedPut:
+    """
+    PresignedPut objects are part of the Bulk Data Storage system
+    and are used to PUT bulk data.
+    """
+
+    headers: dict[str, str]
+    """The headers required to be sent when PUTing bulk data"""
+    url: str
+    """The PUT url used to PUT bulk data"""
