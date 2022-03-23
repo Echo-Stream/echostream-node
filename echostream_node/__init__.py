@@ -272,6 +272,7 @@ class BulkDataStorage:
     """
     Class to manage bulk data storage.
     """
+
     expiration: int
     """Epoch, in seconds, when this expires"""
     presigned_get: str
@@ -470,18 +471,20 @@ class Node(ABC):
         self.__name = name
         self.__node_type = data["__typename"]
         self.__session = Session(
-            botocore_session=_NodeBotocoreSession(node=self, gql_client=gql_client)
+            botocore_session=_NodeBotocoreSession(node=self, gql_client=gql_client),
+            region_name=data["tenant"]["region"],
         )
         self.__sources: frozenset[Edge] = None
         self.__sqs_client: SQSClient = (
-            Session() if self.__app_type == "CrossAccountApp" else self.__session
+            Session(region_name=data["tenant"]["region"])
+            if self.__app_type == "CrossAccountApp"
+            else self.__session
         ).client(
             "sqs",
             config=Config(
                 max_pool_connections=min(20, ((cpu_count() or 1) + 4) * 2),
                 retries={"mode": "standard"},
             ),
-            region_name=data["tenant"]["region"],
         )
         self.__table: str = (
             data["tenant"]["table"] if data["app"].get("tableAccess") else None
