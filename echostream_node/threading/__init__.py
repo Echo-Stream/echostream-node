@@ -99,7 +99,10 @@ class _BulkDataStorageQueue(Queue):
                         with node._gql_client as session:
                             bulk_data_storages: list[dict] = session.execute(
                                 _GET_BULK_DATA_STORAGE_GQL,
-                                variable_values={"tenant": node.tenant},
+                                variable_values={
+                                    "tenant": node.tenant,
+                                    "useAccelerationEndpoint": node.bulk_data_acceleration,
+                                },
                             )["GetBulkDataStorage"]
                 except Exception:
                     getLogger().exception("Error getting bulk data storage")
@@ -194,6 +197,7 @@ class Node(BaseNode):
         self,
         *,
         appsync_endpoint: str = None,
+        bulk_data_acceleration: bool = False,
         client_id: str = None,
         name: str = None,
         password: str = None,
@@ -204,6 +208,7 @@ class Node(BaseNode):
     ) -> None:
         super().__init__(
             appsync_endpoint=appsync_endpoint,
+            bulk_data_acceleration=bulk_data_acceleration,
             client_id=client_id,
             name=name,
             password=password,
@@ -493,6 +498,7 @@ class AppNode(Node):
         self,
         *,
         appsync_endpoint: str = None,
+        bulk_data_acceleration: bool = False,
         client_id: str = None,
         executor: Executor = None,
         name: str = None,
@@ -504,6 +510,7 @@ class AppNode(Node):
     ) -> None:
         super().__init__(
             appsync_endpoint=appsync_endpoint,
+            bulk_data_acceleration=bulk_data_acceleration,
             client_id=client_id,
             name=name,
             password=password,
@@ -564,6 +571,7 @@ class LambdaNode(Node):
         self,
         *,
         appsync_endpoint: str = None,
+        bulk_data_acceleration: bool = False,
         client_id: str = None,
         concurrent_processing: bool = False,
         name: str = None,
@@ -576,6 +584,7 @@ class LambdaNode(Node):
     ) -> None:
         super().__init__(
             appsync_endpoint=appsync_endpoint,
+            bulk_data_acceleration=bulk_data_acceleration,
             client_id=client_id,
             name=name,
             password=password,

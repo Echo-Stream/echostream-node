@@ -135,8 +135,8 @@ _GET_AWS_CREDENTIALS_GQL = gql(
 
 _GET_BULK_DATA_STORAGE_GQL = gql(
     """
-    query getBulkDataStorage($tenant: String!) {
-        GetBulkDataStorage(tenant: $tenant, contentEncoding: gzip, count: 20) {
+    query getBulkDataStorage($tenant: String!, $useAccelerationEndpoint: Boolean!) {
+        GetBulkDataStorage(tenant: $tenant, count: 20, useAccelerationEndpoint: $useAccelerationEndpoint) {
             expiration
             presignedGet
             presignedPost {
@@ -437,6 +437,7 @@ class Node(ABC):
         self,
         *,
         appsync_endpoint: str = None,
+        bulk_data_acceleration: bool = False,
         client_id: str = None,
         gql_transport_cls: type = CognitoRequestsHTTPTransport,
         name: str = None,
@@ -469,6 +470,7 @@ class Node(ABC):
             )["GetNode"]
         self.__app = data["app"]["name"]
         self.__app_type = data["app"]["__typename"]
+        self.__bulk_data_acceleration = bulk_data_acceleration
         self.__config: dict[str, Any] = None
         self.__gql_client = GqlClient(
             fetch_schema_from_transport=True,
@@ -535,6 +537,10 @@ class Node(ABC):
     @property
     def app_type(self) -> str:
         return self.__app_type
+
+    @property
+    def bulk_data_acceleration(self) -> bool:
+        return self.__bulk_data_acceleration
 
     @property
     def config(self) -> dict[str, Any]:

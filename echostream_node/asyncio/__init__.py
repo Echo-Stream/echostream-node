@@ -131,7 +131,10 @@ class _BulkDataStorageQueue(asyncio.Queue):
                                 bulk_data_storages = (
                                     await session.execute(
                                         _GET_BULK_DATA_STORAGE_GQL,
-                                        variable_values={"tenant": node.tenant},
+                                        variable_values={
+                                            "tenant": node.tenant,
+                                            "useAccelerationEndpoint": node.bulk_data_acceleration,
+                                        },
                                     )
                                 )["GetBulkDataStorage"]
                     except asyncio.CancelledError:
@@ -408,6 +411,7 @@ class Node(BaseNode):
         self,
         *,
         appsync_endpoint: str = None,
+        bulk_data_acceleration: bool = False,
         client_id: str = None,
         concurrent_processing: bool = False,
         name: str = None,
@@ -419,6 +423,7 @@ class Node(BaseNode):
     ) -> None:
         super().__init__(
             appsync_endpoint=appsync_endpoint,
+            bulk_data_acceleration=bulk_data_acceleration,
             client_id=client_id,
             gql_transport_cls=CognitoAIOHTTPTransport,
             name=name,
