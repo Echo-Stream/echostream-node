@@ -589,7 +589,7 @@ class LambdaNode(Node):
             name=name,
             password=password,
             tenant=tenant,
-            timeout=timeout,
+            timeout=timeout or 0.01,
             user_pool_id=user_pool_id,
             username=username,
         )
@@ -680,7 +680,7 @@ class LambdaNode(Node):
                 for func in handle_received_messages:
                     func()
         finally:
-            self.join()
+            Thread(daemon=False, name="join", target=self.join).start()
         if self.__report_batch_item_failures and batch_item_failures:
             return dict(
                 batchItemFailures=[
