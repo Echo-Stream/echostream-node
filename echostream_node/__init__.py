@@ -557,6 +557,7 @@ class Node(ABC):
         *,
         group_id: str = None,
         previous_tracking_ids: Union[list[str], str] = None,
+        tracking_id: str,
     ) -> Message:
         """
         Creates message as per the message standard of echostream.
@@ -565,12 +566,14 @@ class Node(ABC):
         body - [POSITIONAL ARGUMENT] content of the message
         group_id - [KEYWORD ARGUMENT] group id
         previous_tracking_ids - [KEYWORD ARGUMENT] previous tracking id of the message if available
+        tracking_id - [KEYWORD ARGUMENT] tracking id of the message if available
         """
         return Message(
             body=body,
             group_id=group_id,
             message_type=self.send_message_type,
             previous_tracking_ids=previous_tracking_ids,
+            tracking_id=tracking_id,
         )
 
     @property
