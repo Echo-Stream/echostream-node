@@ -482,7 +482,7 @@ class Node(BaseNode):
     def audit_messages(
         self,
         /,
-        messages: list[Message], 
+        messages: list[Message],
         *,
         extra_attributes: list[dict[str, Any]] = None,
         source: str = None,
@@ -490,11 +490,13 @@ class Node(BaseNode):
         """
         Audits the provided messages. If extra_attibutes is
         supplied they will be added to the respective message's audit
-        dict and they must have the same count as messages. 
+        dict and they must have the same count as messages.
         If source is provided, it will be recorded in the audit.
         """
         if extra_attributes and len(extra_attributes) != len(messages):
-            raise ValueError("messages and extra_attributes must have the same number of items")
+            raise ValueError(
+                "messages and extra_attributes must have the same number of items"
+            )
         for message, attributes in zip(messages, extra_attributes):
             self.audit_message(message, extra_attributes=attributes, source=source)
 
