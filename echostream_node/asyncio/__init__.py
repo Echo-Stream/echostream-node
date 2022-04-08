@@ -479,6 +479,25 @@ class Node(BaseNode):
         except KeyError:
             raise ValueError(f"Unrecognized message type {message_type.name}")
 
+    def audit_messages(
+        self,
+        /,
+        messages: list[Message], 
+        *,
+        extra_attributes: list[dict[str, Any]] = None,
+        source: str = None,
+    ) -> None:
+        """
+        Audits the provided messages. If extra_attibutes is
+        supplied they will be added to the respective message's audit
+        dict and they must have the same count as messages. 
+        If source is provided, it will be recorded in the audit.
+        """
+        if extra_attributes and len(extra_attributes) != len(messages):
+            raise ValueError("messages and extra_attributes must have the same number of items")
+        for message, attributes in zip(messages, extra_attributes):
+            self.audit_message(message, extra_attributes=attributes, source=source)
+
     async def handle_bulk_data(self, data: Union[bytearray, bytes]) -> str:
         """
         Posts data as bulk data and returns a GET URL for data retrieval.
