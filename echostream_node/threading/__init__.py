@@ -468,7 +468,7 @@ class _SourceMessageReceiver(Thread):
                         continue
                     getLogger().info(f"Received {len(sqs_messages)} from {edge.name}")
 
-                    handle_received_messages = [
+                    message_handlers = [
                         partial(
                             handle_received_message,
                             Message(
@@ -487,14 +487,23 @@ class _SourceMessageReceiver(Thread):
                         for sqs_message in sqs_messages
                     ]
 
-                    if executor := node._executor:
-                        wait(
-                            [executor.submit(func) for func in handle_received_messages]
-                        )
-                    else:
-                        for func in handle_received_messages:
-                            if not func():
-                                break
+                    def handle_received_messages() -> None:
+                        if executor := node._executor:
+                            wait(
+                                [
+                                    executor.submit(message_handler)
+                                    for message_handler in message_handlers
+                                ]
+                            )
+                        else:
+                            for message_handler in message_handlers:
+                                if not message_handler():
+                                    break
+
+                    Thread(
+                        name="handle_received_messages",
+                        target=handle_received_messages,
+                    ).start()
 
             getLogger().info(f"Stopping receiving messages from {edge.name}")
 

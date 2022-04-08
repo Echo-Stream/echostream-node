@@ -272,7 +272,7 @@ class _SourceMessageReceiver:
                         continue
                     getLogger().info(f"Received {len(sqs_messages)} from {edge.name}")
 
-                    handle_received_messages = [
+                    message_handlers = [
                         handle_received_message(
                             Message(
                                 body=sqs_message["Body"],
@@ -289,12 +289,18 @@ class _SourceMessageReceiver:
                         )
                         for sqs_message in sqs_messages
                     ]
-                    if node._concurrent_processing:
-                        await asyncio.gather(*handle_received_messages)
-                    else:
-                        for coro in handle_received_messages:
-                            if not await coro:
-                                break
+
+                    async def handle_received_messages() -> None:
+                        if node._concurrent_processing:
+                            await asyncio.gather(*message_handlers)
+                        else:
+                            for message_handler in message_handlers:
+                                if not await message_handler:
+                                    break
+
+                    asyncio.create_task(
+                        handle_received_messages(), name="handle_received_messages"
+                    )
 
             getLogger().info(f"Stopping receiving messages from {edge.name}")
 
