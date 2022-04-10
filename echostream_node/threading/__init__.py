@@ -7,6 +7,7 @@ from functools import partial
 from gzip import GzipFile
 from io import BytesIO
 from queue import Empty, Queue
+from signal import SIGTERM, signal
 from threading import Event, RLock, Thread
 from time import sleep
 from typing import TYPE_CHECKING, Any, BinaryIO, Generator, Union
@@ -16,9 +17,14 @@ import dynamic_function_loader
 from aws_error_utils import catch_aws_error
 from requests import post
 
-from .. import _CREATE_AUDIT_RECORDS, _GET_BULK_DATA_STORAGE_GQL, _GET_NODE_GQL
+from .. import (
+    _CREATE_AUDIT_RECORDS,
+    _GET_BULK_DATA_STORAGE_GQL,
+    _GET_NODE_GQL,
+    BatchItemFailures,
+)
 from .. import BulkDataStorage as BaseBulkDataStorage
-from .. import Edge, LambdaEvent, Message, MessageType
+from .. import Edge, LambdaEvent, LambdaSqsRecords, Message, MessageType
 from .. import Node as BaseNode
 from .. import getLogger
 
@@ -383,7 +389,7 @@ class Node(BaseNode):
 
 
 class _DeleteMessageQueue(Queue):
-    def __init__(self, edge: Edge, node: Node) -> None:
+    def __init__(self, edge: Edge, node: AppNode) -> None:
         super().__init__()
 
         def deleter() -> None:
@@ -624,6 +630,7 @@ class LambdaNode(Node):
             username=username,
         )
         self.start()
+        signal(SIGTERM, self._shutdown_handler)
         self.__executor: Executor = (
             ThreadPoolExecutor() if concurrent_processing else None
         )
@@ -635,7 +642,12 @@ class LambdaNode(Node):
     def _get_source(self, queue_arn: str) -> str:
         return self.__queue_name_to_source[queue_arn.split(":")[-1:][0]]
 
-    def handle_event(self, event: LambdaEvent) -> None:
+    def _shutdown_handler(self, signum: int, _: object) -> None:
+        getLogger().info("Received SIGTERM, shutting down")
+        self.join()
+        getLogger().info("Shutdown complete")
+
+    def handle_event(self, event: LambdaEvent) -> BatchItemFailures:
         """
         Handles the AWS Lambda event passed into the containing
         AWS Lambda function during invocation.
@@ -643,19 +655,7 @@ class LambdaNode(Node):
         This is intended to be the only called method in your
         containing AWS Lambda function.
         """
-        records: list[
-            dict[
-                str,
-                Union[
-                    str,
-                    dict[str, str],
-                    dict[
-                        str,
-                        dict[str, dict[str, Union[str, bytes, list[str], list[bytes]]]],
-                    ],
-                ],
-            ]
-        ] = None
+        records: LambdaSqsRecords = None
         if not (records := event.get("Records")):
             getLogger().warning(f"No Records found in event {event}")
             return
@@ -679,7 +679,7 @@ class LambdaNode(Node):
                 if self.__report_batch_item_failures:
                     batch_item_failures.remove(message_id)
 
-        handle_received_messages = [
+        message_handlers = [
             partial(
                 handle_received_message,
                 Message(
@@ -699,18 +699,19 @@ class LambdaNode(Node):
             for record in records
         ]
 
-        try:
-            if executor := self.__executor:
-                for future in as_completed(
-                    [executor.submit(func) for func in handle_received_messages]
-                ):
-                    if exception := future.exception():
-                        raise exception
-            else:
-                for func in handle_received_messages:
-                    func()
-        finally:
-            Thread(daemon=False, name="join", target=self.join).start()
+        if executor := self.__executor:
+            for future in as_completed(
+                [
+                    executor.submit(message_handler)
+                    for message_handler in message_handlers
+                ]
+            ):
+                if exception := future.exception():
+                    raise exception
+        else:
+            for message_handler in message_handlers:
+                message_handler()
+        self.join()
         if self.__report_batch_item_failures and batch_item_failures:
             return dict(
                 batchItemFailures=[
