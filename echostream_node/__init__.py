@@ -269,6 +269,8 @@ class _NodeBotocoreSession(BotocoreSession):
 Auditor = Callable[..., dict[str, Any]]
 """Typing for MessageType auditor functions"""
 
+BatchItemFailures = dict[str, list[dict[str, str]]]
+
 
 @dataclass(frozen=True, init=False)
 class BulkDataStorage:
@@ -338,6 +340,20 @@ class Edge:
 
 LambdaEvent = Union[bool, dict, float, int, list, str, tuple, None]
 """Typing for the various types that a Lambda can be invoked with"""
+
+LambdaSqsRecords = list[
+    dict[
+        str,
+        Union[
+            str,
+            dict[str, str],
+            dict[
+                str,
+                dict[str, dict[str, Union[str, bytes, list[str], list[bytes]]]],
+            ],
+        ],
+    ]
+]
 
 
 @dataclass(frozen=True, init=False)
