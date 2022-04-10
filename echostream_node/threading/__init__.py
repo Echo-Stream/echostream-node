@@ -11,7 +11,6 @@ from signal import SIGTERM, signal
 from threading import Event, RLock, Thread
 from time import sleep
 from typing import TYPE_CHECKING, Any, BinaryIO, Generator, Union
-from uuid import uuid4
 
 import dynamic_function_loader
 from aws_error_utils import catch_aws_error
@@ -691,8 +690,7 @@ class LambdaNode(Node):
                     .get("stringValue"),
                     tracking_id=record["messageAttributes"]
                     .get("trackingId", {})
-                    .get("stringValue")
-                    or uuid4().hex,
+                    .get("stringValue"),
                 ),
                 record["messageId"],
             )
