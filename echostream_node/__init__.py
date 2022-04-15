@@ -573,7 +573,7 @@ class Node(ABC):
         *,
         group_id: str = None,
         previous_tracking_ids: Union[list[str], str] = None,
-        tracking_id: str,
+        tracking_id: str = None,
     ) -> Message:
         """
         Creates message as per the message standard of echostream.
