@@ -464,18 +464,18 @@ class Node(ABC):
         username: str = None,
     ) -> None:
         super().__init__()
-        cognito = Cognito(
+        self.__cognito = Cognito(
             client_id=client_id or environ["CLIENT_ID"],
             user_pool_id=user_pool_id or environ["USER_POOL_ID"],
             username=username or environ["USER_NAME"],
         )
-        cognito.authenticate(password=password or environ["PASSWORD"])
+        self.__cognito.authenticate(password=password or environ["PASSWORD"])
         name = name or environ["NODE"]
         tenant = tenant or environ["TENANT"]
         gql_client = GqlClient(
             fetch_schema_from_transport=True,
             transport=CognitoRequestsHTTPTransport(
-                cognito,
+                self.__cognito,
                 appsync_endpoint or environ["APPSYNC_ENDPOINT"],
             ),
         )
@@ -491,7 +491,7 @@ class Node(ABC):
         self.__gql_client = GqlClient(
             fetch_schema_from_transport=True,
             transport=gql_transport_cls(
-                cognito,
+                self.__cognito,
                 appsync_endpoint or environ["APPSYNC_ENDPOINT"],
             ),
         )
@@ -521,6 +521,10 @@ class Node(ABC):
         self.__timeout = timeout or 0.1
         self._receive_message_type: MessageType = None
         self._send_message_type: MessageType = None
+
+    @property
+    def _cognito(self) -> Cognito:
+        return self.__cognito
 
     @property
     def _gql_client(self) -> GqlClient:

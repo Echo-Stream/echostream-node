@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json
+import simplejson as json
 from concurrent.futures import Executor, ThreadPoolExecutor, as_completed, wait
 from datetime import datetime, timezone
 from functools import partial
