@@ -39,24 +39,6 @@ else:
     SQSClient = object
     Table = object
 
-_CREATE_AUDIT_RECORDS = gql(
-    """
-    query getNode($name: String!, $tenant: String!, $messageType: String!, $auditRecords: [AuditRecord!]!) {
-        GetNode(name: $name, tenant: $tenant) {
-            ... on AppChangeReceiverNode {
-                CreateAuditRecords(messageType: $messageType, auditRecords: $auditRecords) 
-            }
-            ... on ExternalNode {
-                CreateAuditRecords(messageType: $messageType, auditRecords: $auditRecords) 
-            }
-            ... on ManagedNode {
-                CreateAuditRecords(messageType: $messageType, auditRecords: $auditRecords)
-            }
-        }
-    }
-    """
-)
-
 _GET_APP_GQL = gql(
     """
     query getNode($name: String!, $tenant: String!) {
@@ -66,14 +48,17 @@ _GET_APP_GQL = gql(
                 app {
                     __typename
                     ... on CrossAccountApp {
+                        auditRecordsEndpoint
                         name
                         tableAccess
                     }
                     ... on ExternalApp {
+                        auditRecordsEndpoint
                         name
                         tableAccess
                     }
                     ... on ManagedApp {
+                        auditRecordsEndpoint
                         name
                         tableAccess
                     }
@@ -83,10 +68,12 @@ _GET_APP_GQL = gql(
                 app {
                     __typename
                     ... on CrossAccountApp {
+                        auditRecordsEndpoint
                         name
                         tableAccess
                     }
                     ... on ExternalApp {
+                        auditRecordsEndpoint
                         name
                         tableAccess
                     }
@@ -95,6 +82,7 @@ _GET_APP_GQL = gql(
             ... on ManagedNode {
                 app {
                     __typename
+                    auditRecordsEndpoint
                     name
                     tableAccess
                 }
@@ -486,6 +474,7 @@ class Node(ABC):
             )["GetNode"]
         self.__app = data["app"]["name"]
         self.__app_type = data["app"]["__typename"]
+        self.__audit_records_endpoint = data["app"]["auditRecordsEndpoint"]
         self.__bulk_data_acceleration = bulk_data_acceleration
         self.__config: dict[str, Any] = None
         self.__gql_client = GqlClient(
@@ -521,6 +510,10 @@ class Node(ABC):
         self.__timeout = timeout or 0.1
         self._receive_message_type: MessageType = None
         self._send_message_type: MessageType = None
+
+    @property
+    def _audit_records_endpoint(self) -> str:
+        return self.__audit_records_endpoint
 
     @property
     def _cognito(self) -> Cognito:

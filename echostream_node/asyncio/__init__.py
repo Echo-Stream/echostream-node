@@ -18,7 +18,6 @@ from gql.transport.aiohttp import AIOHTTPTransport
 from pycognito import Cognito
 
 from .. import (
-    _CREATE_AUDIT_RECORDS,
     _GET_BULK_DATA_STORAGE_GQL,
     _GET_NODE_GQL,
     BatchItemFailures,
@@ -41,6 +40,11 @@ else:
 class _AuditRecordQueue(asyncio.Queue):
     def __init__(self, message_type: MessageType, node: Node) -> None:
         super().__init__()
+
+        async def cognito_auth() -> dict[str, str]:
+            async with node._lock:
+                node._cognito.check_token()
+            return dict(Authorization=f"Bearer {node._cognito.access_token}")
 
         async def sender() -> None:
             cancelled = asyncio.Event()
@@ -70,26 +74,27 @@ class _AuditRecordQueue(asyncio.Queue):
                             yield batch
                             batch = list()
 
-            async for batch in batcher():
-                try:
+            async with ClientSession() as session:
+                async for batch in batcher():
                     async with node._lock:
-                        async with node._gql_client as session:
-                            await session.execute(
-                                _CREATE_AUDIT_RECORDS,
-                                variable_values=dict(
-                                    name=node.name,
-                                    tenant=node.tenant,
-                                    messageType=message_type.name,
-                                    auditRecords=batch,
-                                ),
-                            )
-                except asyncio.CancelledError:
-                    cancelled.set()
-                except Exception:
-                    getLogger().exception("Error creating audit records")
-                finally:
-                    for _ in range(len(batch)):
-                        self.task_done()
+                        node._cognito.check_token()
+                    try:
+                        async with session.post(
+                            headers=await cognito_auth(),
+                            json=dict(
+                                messageType=message_type,
+                                auditRecords=batch,
+                            ),
+                            url=f"{node._audit_records_endpoint}/{node.name}",
+                        ) as response:
+                            response.raise_for_status()
+                    except asyncio.CancelledError:
+                        cancelled.set()
+                    except Exception:
+                        getLogger().exception("Error creating audit records")
+                    finally:
+                        for _ in range(len(batch)):
+                            self.task_done()
 
         asyncio.create_task(sender(), name=f"AuditRecordsSender")
 
@@ -116,7 +121,7 @@ class _BulkDataStorage(BaseBulkDataStorage):
             form_data = FormData(self.presigned_post.fields)
             form_data.add_field("file", buffer, filename="bulk_data")
             async with self.__client_session.post(
-                self.presigned_post.url, data=form_data
+                data=form_data, url=self.presigned_post.url
             ) as response:
                 response.raise_for_status()
         return self.presigned_get

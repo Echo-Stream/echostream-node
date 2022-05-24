@@ -7,6 +7,8 @@ from functools import partial
 from gzip import GzipFile
 from io import BytesIO
 from queue import Empty, Queue
+from requests import Session
+from requests.models import PreparedRequest
 from signal import SIGTERM, signal
 from threading import Event, RLock, Thread
 from time import sleep
@@ -17,7 +19,6 @@ from aws_error_utils import catch_aws_error
 from requests import post
 
 from .. import (
-    _CREATE_AUDIT_RECORDS,
     _GET_BULK_DATA_STORAGE_GQL,
     _GET_NODE_GQL,
     BatchItemFailures,
@@ -37,37 +38,53 @@ else:
     SendMessageBatchRequestEntryTypeDef = dict
 
 
-class _AuditRecordQueue(Queue):
+class _Queue(Queue):
+    def tasks_done(self, count: int) -> None:
+        with self.all_tasks_done:
+            unfinished = self.unfinished_tasks - count
+            if unfinished < 0:
+                raise ValueError("count larger than unfinished tasks")
+            if unfinished == 0:
+                self.all_tasks_done.notify_all()
+            self.unfinished_tasks = unfinished
+
+
+class _AuditRecordQueue(_Queue):
     def __init__(self, message_type: MessageType, node: Node) -> None:
         super().__init__()
 
+        def cognito_auth(prepared_request: PreparedRequest) -> PreparedRequest:
+            with node._lock:
+                node._cognito.check_token()
+            prepared_request.headers[
+                "Authorization"
+            ] = f"Bearer {node._cognito.access_token}"
+            return prepared_request
+
         def sender() -> None:
-            while True:
-                batch: list[dict] = list()
-                while len(batch) < 500:
+            with Session() as session:
+                while True:
+                    batch: list[dict] = list()
+                    while len(batch) < 500:
+                        try:
+                            batch.append(self.get(timeout=node.timeout))
+                        except Empty:
+                            break
+                    if not batch:
+                        continue
                     try:
-                        batch.append(self.get(timeout=node.timeout))
-                    except Empty:
-                        break
-                if not batch:
-                    continue
-                try:
-                    with node._lock:
-                        with node._gql_client as session:
-                            session.execute(
-                                _CREATE_AUDIT_RECORDS,
-                                variable_values=dict(
-                                    name=node.name,
-                                    tenant=node.tenant,
-                                    messageType=message_type.name,
-                                    auditRecords=batch,
-                                ),
-                            )
-                except Exception:
-                    getLogger().exception("Error creating audit records")
-                finally:
-                    for _ in range(len(batch)):
-                        self.task_done()
+                        session.post(
+                            auth=cognito_auth,
+                            json=dict(
+                                messageType=message_type,
+                                auditRecords=batch,
+                            ),
+                            url=f"{node._audit_records_endpoint}/{node.name}",
+                        ).raise_for_status()
+                    except Exception:
+                        getLogger().exception("Error creating audit records")
+                    finally:
+                        self.tasks_done(len(batch))
 
         Thread(daemon=True, name=f"AuditRecordsSender", target=sender).start()
 
@@ -129,7 +146,7 @@ class _BulkDataStorageQueue(Queue):
         )
 
 
-class _TargetMessageQueue(Queue):
+class _TargetMessageQueue(_Queue):
     def __init__(self, node: Node, edge: Edge) -> None:
         super().__init__()
 
@@ -182,8 +199,7 @@ class _TargetMessageQueue(Queue):
                 except Exception:
                     getLogger().exception(f"Error sending messages to {edge.name}")
                 finally:
-                    for _ in range(len(entries)):
-                        self.task_done()
+                    self.tasks_done(len(entries))
 
         Thread(
             daemon=True, name=f"TargetMessageSender({edge.name})", target=sender
@@ -387,7 +403,7 @@ class Node(BaseNode):
         pass
 
 
-class _DeleteMessageQueue(Queue):
+class _DeleteMessageQueue(_Queue):
     def __init__(self, edge: Edge, node: AppNode) -> None:
         super().__init__()
 
@@ -419,8 +435,7 @@ class _DeleteMessageQueue(Queue):
                 except Exception:
                     getLogger().exception(f"Error deleting messages from {edge.name}")
                 finally:
-                    for _ in range(len(receipt_handles)):
-                        self.task_done()
+                    self.tasks_done(len(receipt_handles))
 
         Thread(
             daemon=True, name=f"SourceMessageDeleter({edge.name})", target=deleter
