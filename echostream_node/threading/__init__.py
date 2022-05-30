@@ -1,32 +1,36 @@
 from __future__ import annotations
 
-import simplejson as json
 from concurrent.futures import Executor, ThreadPoolExecutor, as_completed, wait
 from datetime import datetime, timezone
 from functools import partial
-from gzip import GzipFile
+from gzip import GzipFile, compress
 from io import BytesIO
+from os import environ
 from queue import Empty, Queue
-from requests import Session
-from requests.models import PreparedRequest
 from signal import SIGTERM, signal
 from threading import Event, RLock, Thread
 from time import sleep
 from typing import TYPE_CHECKING, Any, BinaryIO, Generator, Union
 
 import dynamic_function_loader
+import simplejson as json
 from aws_error_utils import catch_aws_error
-from requests import post
+from gql import Client as GqlClient
+from httpx import Client as HttpxClient
+from httpx_auth import AWS4Auth
 
-from .. import (
-    _GET_BULK_DATA_STORAGE_GQL,
-    _GET_NODE_GQL,
-    BatchItemFailures,
-)
+from .. import _GET_BULK_DATA_STORAGE_GQL, _GET_NODE_GQL, BatchItemFailures
 from .. import BulkDataStorage as BaseBulkDataStorage
-from .. import Edge, LambdaEvent, LambdaSqsRecords, Message, MessageType
+from .. import (
+    CognitoRequestsHTTPTransport,
+    Edge,
+    LambdaEvent,
+    LambdaSqsRecords,
+    Message,
+    MessageType,
+)
 from .. import Node as BaseNode
-from .. import getLogger
+from .. import PresignedPost, getLogger
 
 if TYPE_CHECKING:
     from mypy_boto3_sqs.type_defs import (
@@ -53,16 +57,8 @@ class _AuditRecordQueue(_Queue):
     def __init__(self, message_type: MessageType, node: Node) -> None:
         super().__init__()
 
-        def cognito_auth(prepared_request: PreparedRequest) -> PreparedRequest:
-            with node._lock:
-                node._cognito.check_token()
-            prepared_request.headers[
-                "Authorization"
-            ] = f"Bearer {node._cognito.access_token}"
-            return prepared_request
-
         def sender() -> None:
-            with Session() as session:
+            with HttpxClient() as client:
                 while True:
                     batch: list[dict] = list()
                     while len(batch) < 500:
@@ -72,15 +68,36 @@ class _AuditRecordQueue(_Queue):
                             break
                     if not batch:
                         continue
+                    credentials = (
+                        node._session.get_credentials().get_frozen_credentials()
+                    )
+                    auth = AWS4Auth(
+                        access_id=credentials.access_key,
+                        region=node._session.region_name,
+                        secret_key=credentials.secret_key,
+                        service="lambda",
+                        security_token=credentials.token,
+                    )
+                    post_args = dict(
+                        auth=auth,
+                        url=f"{node._audit_records_endpoint}/{node.name}",
+                    )
+                    body = dict(
+                        messageType=message_type.name,
+                        auditRecords=batch,
+                    )
+                    if len(batch) <= 10:
+                        post_args["json"] = body
+                    else:
+                        post_args["content"] = compress(
+                            json.dumps(body, separators=(",", ":")).encode()
+                        )
+                        post_args["headers"] = {
+                            "Content-Encoding": "gzip",
+                            "Content-Type": "application/json",
+                        }
                     try:
-                        session.post(
-                            auth=cognito_auth,
-                            json=dict(
-                                messageType=message_type,
-                                auditRecords=batch,
-                            ),
-                            url=f"{node._audit_records_endpoint}/{node.name}",
-                        ).raise_for_status()
+                        client.post(**post_args).raise_for_status()
                     except Exception:
                         getLogger().exception("Error creating audit records")
                     finally:
@@ -93,6 +110,14 @@ class _AuditRecordQueue(_Queue):
 
 
 class _BulkDataStorage(BaseBulkDataStorage):
+    def __init__(
+        self,
+        bulk_data_storage: dict[str, Union[str, PresignedPost]],
+        client: HttpxClient,
+    ) -> None:
+        super().__init__(bulk_data_storage)
+        self.__client = client
+
     def handle_bulk_data(self, data: Union[bytearray, bytes, BinaryIO]) -> str:
         if isinstance(data, BinaryIO):
             data = data.read()
@@ -100,7 +125,7 @@ class _BulkDataStorage(BaseBulkDataStorage):
             with GzipFile(mode="wb", fileobj=buffer) as gzf:
                 gzf.write(data)
             buffer.seek(0)
-            post(
+            self.__client.post(
                 self.presigned_post.url,
                 data=self.presigned_post.fields,
                 files=dict(file=("bulk_data", buffer)),
@@ -114,24 +139,25 @@ class _BulkDataStorageQueue(Queue):
         self.__fill = Event()
 
         def filler() -> None:
-            while True:
-                self.__fill.wait()
-                try:
-                    with node._lock:
-                        with node._gql_client as session:
-                            bulk_data_storages: list[dict] = session.execute(
-                                _GET_BULK_DATA_STORAGE_GQL,
-                                variable_values={
-                                    "tenant": node.tenant,
-                                    "useAccelerationEndpoint": node.bulk_data_acceleration,
-                                },
-                            )["GetBulkDataStorage"]
-                except Exception:
-                    getLogger().exception("Error getting bulk data storage")
-                else:
-                    for bulk_data_storage in bulk_data_storages:
-                        self.put_nowait(_BulkDataStorage(bulk_data_storage))
-                self.__fill.clear()
+            with HttpxClient() as client:
+                while True:
+                    self.__fill.wait()
+                    try:
+                        with node._lock:
+                            with node._gql_client as session:
+                                bulk_data_storages: list[dict] = session.execute(
+                                    _GET_BULK_DATA_STORAGE_GQL,
+                                    variable_values={
+                                        "tenant": node.tenant,
+                                        "useAccelerationEndpoint": node.bulk_data_acceleration,
+                                    },
+                                )["GetBulkDataStorage"]
+                    except Exception:
+                        getLogger().exception("Error getting bulk data storage")
+                    else:
+                        for bulk_data_storage in bulk_data_storages:
+                            self.put_nowait(_BulkDataStorage(bulk_data_storage, client))
+                    self.__fill.clear()
 
         Thread(daemon=True, name="BulkDataStorageQueueFiller", target=filler).start()
 
@@ -238,10 +264,21 @@ class Node(BaseNode):
             user_pool_id=user_pool_id,
             username=username,
         )
-        self.__bulk_data_storage_queue = _BulkDataStorageQueue(self)
         self.__audit_records_queues: dict[str, _AuditRecordQueue] = dict()
+        self.__bulk_data_storage_queue = _BulkDataStorageQueue(self)
+        self.__gql_client = GqlClient(
+            fetch_schema_from_transport=True,
+            transport=CognitoRequestsHTTPTransport(
+                self.__cognito,
+                appsync_endpoint or environ["APPSYNC_ENDPOINT"],
+            ),
+        )
         self.__lock = RLock()
         self.__target_message_queues: dict[str, _TargetMessageQueue] = dict()
+
+    @property
+    def _gql_client(self) -> GqlClient:
+        return self.__gql_client
 
     @property
     def _lock(self) -> RLock:

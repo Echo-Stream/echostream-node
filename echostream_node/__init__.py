@@ -13,12 +13,13 @@ import awsserviceendpoints
 import simplejson as json
 from boto3.session import Session
 from botocore.config import Config
-from botocore.credentials import DeferredRefreshableCredentials
+from botocore.credentials import DeferredRefreshableCredentials, Credentials
 from botocore.session import Session as BotocoreSession
 from gql import Client as GqlClient
 from gql import gql
 from gql.transport.requests import RequestsHTTPTransport
 from pycognito import Cognito
+from pycognito.utils import RequestsSrpAuth
 
 
 def getLogger() -> logging.Logger:
@@ -100,6 +101,14 @@ _GET_AWS_CREDENTIALS_GQL = gql(
     """
     query getAppAwsCredentials($name: String!, $tenant: String!, $duration: Int!) {
         GetApp(name: $name, tenant: $tenant) {
+            ... on CrossAccountApp {
+                GetAwsCredentials(duration: $duration) {
+                    accessKeyId
+                    secretAccessKey
+                    sessionToken
+                    expiration
+                }
+            }
             ... on ExternalApp {
                 GetAwsCredentials(duration: $duration) {
                     accessKeyId
@@ -229,7 +238,7 @@ class _NodeBotocoreSession(BotocoreSession):
         super().__init__()
         lock = RLock()
 
-        def refresher():
+        def refresher() -> dict[str, str]:
             with lock:
                 with gql_client as session:
                     credentials = session.execute(
@@ -245,13 +254,12 @@ class _NodeBotocoreSession(BotocoreSession):
                 token=credentials["sessionToken"],
             )
 
-        setattr(
-            self,
-            "_credentials",
-            DeferredRefreshableCredentials(
-                method="GetApp.GetAwsCredentials", refresh_using=refresher
-            ),
+        self.__credentials = DeferredRefreshableCredentials(
+            method="GetApp.GetAwsCredentials", refresh_using=refresher
         )
+
+    def get_credentials(self) -> Credentials:
+        return self.__credentials
 
 
 Auditor = Callable[..., dict[str, Any]]
@@ -304,15 +312,7 @@ class BulkDataStorage:
 
 class CognitoRequestsHTTPTransport(RequestsHTTPTransport):
     def __init__(self, cognito: Cognito, url: str, **kwargs: Any) -> None:
-        self._cognito = cognito
-        super().__init__(url, **kwargs)
-
-    def __getattribute__(self, name: str) -> Any:
-        if name == "headers":
-            self._cognito.check_token()
-            return dict(Authorization=self._cognito.access_token)
-        return super().__getattribute__(name)
-
+        super().__init__(auth=RequestsSrpAuth(cognito=cognito, http_header_prefix=""), url=url, **kwargs)
 
 @dataclass(frozen=True)
 class Edge:
@@ -443,7 +443,6 @@ class Node(ABC):
         appsync_endpoint: str = None,
         bulk_data_acceleration: bool = False,
         client_id: str = None,
-        gql_transport_cls: type = CognitoRequestsHTTPTransport,
         name: str = None,
         password: str = None,
         tenant: str = None,
@@ -477,13 +476,6 @@ class Node(ABC):
         self.__audit_records_endpoint = data["app"]["auditRecordsEndpoint"]
         self.__bulk_data_acceleration = bulk_data_acceleration
         self.__config: dict[str, Any] = None
-        self.__gql_client = GqlClient(
-            fetch_schema_from_transport=True,
-            transport=gql_transport_cls(
-                self.__cognito,
-                appsync_endpoint or environ["APPSYNC_ENDPOINT"],
-            ),
-        )
         self.__name = name
         self.__node_type = data["__typename"]
         self.__session = Session(
@@ -520,8 +512,8 @@ class Node(ABC):
         return self.__cognito
 
     @property
-    def _gql_client(self) -> GqlClient:
-        return self.__gql_client
+    def _session(self) -> Session:
+        return self.__session
 
     @property
     def _sources(self) -> frozenset[Edge]:
@@ -612,7 +604,7 @@ class Node(ABC):
     @property
     def table(self) -> Table:
         if self.__table:
-            return self.__session.resource("dynamodb").Table(self.__table)
+            return self._session.resource("dynamodb").Table(self.__table)
         raise RuntimeError(f"App {self.app} does not have tableAccess")
 
     @property
