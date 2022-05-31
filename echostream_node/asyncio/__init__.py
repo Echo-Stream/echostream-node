@@ -2,26 +2,27 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from functools import partial
-from gzip import GzipFile
+from gzip import GzipFile, compress
 from io import BytesIO
-from typing import TYPE_CHECKING, Any, AsyncGenerator, BinaryIO, Union
+from os import environ
+from signal import SIG_IGN, SIGTERM, signal
+from typing import TYPE_CHECKING, Any, AsyncGenerator, BinaryIO, Optional, Union
 
-import aiorun
 import dynamic_function_loader
 import simplejson as json
-import uvloop
-from aiohttp import ClientSession, FormData
+
 from aws_error_utils import catch_aws_error
+from gql import Client as GqlClient
 from gql.transport.aiohttp import AIOHTTPTransport
+from gql.transport.appsync_auth import AppSyncAuthentication
+from httpx import AsyncClient as HttpxClient
+from httpx_auth import AWS4Auth
 from pycognito import Cognito
 
-from .. import (
-    _GET_BULK_DATA_STORAGE_GQL,
-    _GET_NODE_GQL,
-    BatchItemFailures,
-)
+from .. import _GET_BULK_DATA_STORAGE_GQL, _GET_NODE_GQL, BatchItemFailures
 from .. import BulkDataStorage as BaseBulkDataStorage
 from .. import Edge, LambdaEvent, LambdaSqsRecords, Message, MessageType
 from .. import Node as BaseNode
@@ -40,11 +41,6 @@ else:
 class _AuditRecordQueue(asyncio.Queue):
     def __init__(self, message_type: MessageType, node: Node) -> None:
         super().__init__()
-
-        async def cognito_auth() -> dict[str, str]:
-            async with node._lock:
-                node._cognito.check_token()
-            return dict(Authorization=f"Bearer {node._cognito.access_token}")
 
         async def sender() -> None:
             cancelled = asyncio.Event()
@@ -74,20 +70,38 @@ class _AuditRecordQueue(asyncio.Queue):
                             yield batch
                             batch = list()
 
-            async with ClientSession() as session:
+            async with HttpxClient() as client:
                 async for batch in batcher():
-                    async with node._lock:
-                        node._cognito.check_token()
+                    credentials = (
+                        node._session.get_credentials().get_frozen_credentials()
+                    )
+                    auth = AWS4Auth(
+                        access_id=credentials.access_key,
+                        region=node._session.region_name,
+                        secret_key=credentials.secret_key,
+                        service="lambda",
+                        security_token=credentials.token,
+                    )
+                    post_args = dict(
+                        auth=auth,
+                        url=f"{node._audit_records_endpoint}/{node.name}",
+                    )
+                    body = dict(
+                        messageType=message_type.name,
+                        auditRecords=batch,
+                    )
+                    if len(batch) <= 10:
+                        post_args["json"] = body
+                    else:
+                        post_args["content"] = compress(
+                            json.dumps(body, separators=(",", ":")).encode()
+                        )
+                        post_args["headers"] = {
+                            "Content-Encoding": "gzip",
+                            "Content-Type": "application/json",
+                        }
                     try:
-                        async with session.post(
-                            headers=await cognito_auth(),
-                            json=dict(
-                                messageType=message_type,
-                                auditRecords=batch,
-                            ),
-                            url=f"{node._audit_records_endpoint}/{node.name}",
-                        ) as response:
-                            response.raise_for_status()
+                        (await client.post(**post_args)).raise_for_status()
                     except asyncio.CancelledError:
                         cancelled.set()
                     except Exception:
@@ -106,10 +120,10 @@ class _BulkDataStorage(BaseBulkDataStorage):
     def __init__(
         self,
         bulk_data_storage: dict[str, Union[str, PresignedPost]],
-        session: ClientSession,
+        client: HttpxClient,
     ) -> None:
         super().__init__(bulk_data_storage)
-        self.__client_session = session
+        self.__client = client
 
     async def handle_bulk_data(self, data: Union[bytearray, bytes, BinaryIO]) -> str:
         if isinstance(data, BinaryIO):
@@ -118,12 +132,13 @@ class _BulkDataStorage(BaseBulkDataStorage):
             with GzipFile(mode="wb", fileobj=buffer) as gzf:
                 gzf.write(data)
             buffer.seek(0)
-            form_data = FormData(self.presigned_post.fields)
-            form_data.add_field("file", buffer, filename="bulk_data")
-            async with self.__client_session.post(
-                data=form_data, url=self.presigned_post.url
-            ) as response:
-                response.raise_for_status()
+            (
+                await self.__client.post(
+                    self.presigned_post.url,
+                    data=self.presigned_post.fields,
+                    files=dict(file=("bulk_data", buffer)),
+                )
+            ).raise_for_status()
         return self.presigned_get
 
 
@@ -133,7 +148,7 @@ class _BulkDataStorageQueue(asyncio.Queue):
         self.__fill = asyncio.Event()
 
         async def filler() -> None:
-            async with ClientSession() as client_session:
+            async with HttpxClient() as client:
                 cancelled = asyncio.Event()
                 while not cancelled.is_set():
                     bulk_data_storages: list[dict] = list()
@@ -155,9 +170,7 @@ class _BulkDataStorageQueue(asyncio.Queue):
                     except Exception:
                         getLogger().exception("Error getting bulk data storage")
                     for bulk_data_storage in bulk_data_storages:
-                        self.put_nowait(
-                            _BulkDataStorage(bulk_data_storage, client_session)
-                        )
+                        self.put_nowait(_BulkDataStorage(bulk_data_storage, client))
                     self.__fill.clear()
 
         asyncio.create_task(filler(), name="BulkDataStorageQueueFiller")
@@ -249,16 +262,20 @@ class _TargetMessageQueue(asyncio.Queue):
         return await super().get()
 
 
-class CognitoAIOHTTPTransport(AIOHTTPTransport):
-    def __init__(self, cognito: Cognito, url: str, **kwargs: Any) -> None:
+class _AppSyncCognitoAuthentication(AppSyncAuthentication):
+    def __init__(self, cognito: Cognito) -> None:
         self._cognito = cognito
-        super().__init__(url, **kwargs)
 
-    def __getattribute__(self, name: str) -> Any:
-        if name == "headers":
-            self._cognito.check_token()
-            return dict(Authorization=self._cognito.access_token)
-        return super().__getattribute__(name)
+    def get_headers(
+        self, data: Optional[str] = None, headers: Optional[dict[str, Any]] = None
+    ) -> dict[str, Any]:
+        self._cognito.check_token()
+        return dict(Authorization=self._cognito.access_token)
+
+
+class _CognitoAIOHTTPTransport(AIOHTTPTransport):
+    def __init__(self, cognito: Cognito, url: str, **kwargs: Any) -> None:
+        super().__init__(auth=_AppSyncCognitoAuthentication(cognito), url=url, **kwargs)
 
 
 class Node(BaseNode):
@@ -286,7 +303,6 @@ class Node(BaseNode):
             appsync_endpoint=appsync_endpoint,
             bulk_data_acceleration=bulk_data_acceleration,
             client_id=client_id,
-            gql_transport_cls=CognitoAIOHTTPTransport,
             name=name,
             password=password,
             tenant=tenant,
@@ -296,8 +312,19 @@ class Node(BaseNode):
         )
         self.__audit_records_queues: dict[str, _AuditRecordQueue] = dict()
         self.__bulk_data_storage_queue: _BulkDataStorageQueue = None
+        self.__gql_client = GqlClient(
+            fetch_schema_from_transport=True,
+            transport=_CognitoAIOHTTPTransport(
+                self.__cognito,
+                appsync_endpoint or environ["APPSYNC_ENDPOINT"],
+            ),
+        )
         self.__lock: asyncio.Lock = None
         self.__target_message_queues: dict[str, _TargetMessageQueue] = dict()
+
+    @property
+    def _gql_client(self) -> GqlClient:
+        return self.__gql_client
 
     @property
     def _lock(self) -> asyncio.Lock:
@@ -711,42 +738,68 @@ class LambdaNode(Node):
             username=username,
         )
         self.__concurrent_processing = concurrent_processing
-        self.__loop: asyncio.AbstractEventLoop = None
-        self.__queue_name_to_source = {
-            edge.queue.split("/")[-1:][0]: edge.name for edge in self._sources
-        }
+        self.__loop = self._create_event_loop()
+        self.__queue_name_to_source: dict[str, str] = None
         self.__report_batch_item_failures = report_batch_item_failures
 
-        started = threading.Event()
+        # Set up the asyncio loop
+        signal(SIGTERM, self._shutdown_handler)
 
-        async def start_and_run_forever() -> None:
-            try:
-                await self.start()
-                started.set()
-                try:
-                    # Sleep until cancelled by aiorun
-                    while True:
-                        await asyncio.sleep(86400)
-                except asyncio.CancelledError:
-                    pass
-                await self.join()
-            except asyncio.CancelledError:
-                pass
-
-        def event_loop():
-            asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-            self.__loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self.__loop)
-            aiorun.run(
-                start_and_run_forever(), loop=self.__loop, stop_on_unhandled_errors=True
-            )
+        self.__started = threading.Event()
+        self.__loop.create_task(self.start())
 
         # Run the event loop in a seperate thread, or else we will block the main
         # Lambda execution!
-        threading.Thread(name="event_loop", target=event_loop)
+        threading.Thread(name="event_loop", target=self.__run_event_loop).start()
+
         # Wait until the started event is set before returning control to
         # Lambda
-        started.wait()
+        self.__started.wait()
+
+    def __run_event_loop(self) -> None:
+        getLogger().info("Starting event loop")
+        asyncio.set_event_loop(self.__loop)
+
+        pending_exception_to_raise: Exception = None
+
+        def exception_handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+            nonlocal pending_exception_to_raise
+            pending_exception_to_raise = context.get("exception")
+            getLogger().error(
+                "Unhandled exception; stopping loop: %r",
+                context.get("message"),
+                exc_info=pending_exception_to_raise,
+            )
+            loop.stop()
+
+        self.__loop.set_exception_handler(exception_handler)
+        executor = ThreadPoolExecutor()
+        self.__loop.set_default_executor(executor)
+
+        self.__loop.run_forever()
+        getLogger().info("Entering shutdown phase")
+        getLogger().info("Cancelling pending tasks")
+        if tasks := asyncio.all_tasks(self.__loop):
+            for task in tasks:
+                getLogger().debug(f"Cancelling task: {task}")
+                task.cancel()
+            getLogger().info("Running pending tasks till complete")
+            self.__loop.run_until_complete(
+                asyncio.gather(*tasks, return_exceptions=True)
+            )
+        getLogger().info("Waiting for executor shutdown")
+        executor.shutdown(wait=True)
+        getLogger().info("Shutting down async generators")
+        self.__loop.run_until_complete(self.__loop.shutdown_asyncgens())
+        getLogger().info("Closing the loop.")
+        self.__loop.close()
+        getLogger().info("Loop is closed")
+        if pending_exception_to_raise:
+            getLogger().info("Reraising unhandled exception")
+            raise pending_exception_to_raise
+
+    def _create_event_loop(self) -> asyncio.AbstractEventLoop:
+        return asyncio.new_event_loop()
 
     def _get_source(self, queue_arn: str) -> str:
         return self.__queue_name_to_source[queue_arn.split(":")[-1:][0]]
@@ -807,7 +860,7 @@ class LambdaNode(Node):
             await asyncio.gather(*message_handlers)
         else:
             for message_handler in message_handlers:
-                await message_handler()
+                await message_handler
         await self.join()
         if self.__report_batch_item_failures and batch_item_failures:
             return dict(
@@ -817,7 +870,19 @@ class LambdaNode(Node):
                 ]
             )
 
+    def _shutdown_handler(self, signum: int, frame: object) -> None:
+        signal(SIGTERM, SIG_IGN)
+        getLogger().warning("Received SIGTERM, stopping the loop")
+        self.__loop.stop()
+
     def handle_event(self, event: LambdaEvent) -> BatchItemFailures:
         return asyncio.run_coroutine_threadsafe(
             self._handle_event(event), self.__loop
         ).result()
+
+    async def start(self) -> None:
+        await super().start()
+        self.__queue_name_to_source = {
+            edge.queue.split("/")[-1:][0]: edge.name for edge in self._sources
+        }
+        self.__started.set()
