@@ -312,7 +312,12 @@ class BulkDataStorage:
 
 class CognitoRequestsHTTPTransport(RequestsHTTPTransport):
     def __init__(self, cognito: Cognito, url: str, **kwargs: Any) -> None:
-        super().__init__(auth=RequestsSrpAuth(cognito=cognito, http_header_prefix=""), url=url, **kwargs)
+        super().__init__(
+            auth=RequestsSrpAuth(cognito=cognito, http_header_prefix=""),
+            url=url,
+            **kwargs,
+        )
+
 
 @dataclass(frozen=True)
 class Edge:
