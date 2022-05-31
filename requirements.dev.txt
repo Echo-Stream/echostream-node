@@ -1,4 +1,3 @@
-aiorun
 aws-error-utils
 awsserviceendpoints
 black
