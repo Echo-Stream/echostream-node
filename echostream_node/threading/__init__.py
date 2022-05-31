@@ -693,7 +693,7 @@ class LambdaNode(Node):
     def _get_source(self, queue_arn: str) -> str:
         return self.__queue_name_to_source[queue_arn.split(":")[-1:][0]]
 
-    def _shutdown_handler(self, signum: int, _: object) -> None:
+    def _shutdown_handler(self, signum: int, frame: object) -> None:
         getLogger().info("Received SIGTERM, shutting down")
         self.join()
         getLogger().info("Shutdown complete")
