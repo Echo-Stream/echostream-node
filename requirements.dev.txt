@@ -11,5 +11,4 @@ httpx==0.22.*
 httpx-auth
 pycognito
 simplejson
-uvloop
 virtualenv
