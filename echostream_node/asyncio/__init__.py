@@ -101,7 +101,9 @@ class _AuditRecordQueue(asyncio.Queue):
                             "Content-Type": "application/json",
                         }
                     try:
-                        (await client.post(**post_args)).raise_for_status()
+                        response = await client.post(**post_args)
+                        response.raise_for_status()
+                        await response.aclose()
                     except asyncio.CancelledError:
                         cancelled.set()
                     except Exception:
@@ -132,13 +134,13 @@ class _BulkDataStorage(BaseBulkDataStorage):
             with GzipFile(mode="wb", fileobj=buffer) as gzf:
                 gzf.write(data)
             buffer.seek(0)
-            (
-                await self.__client.post(
-                    self.presigned_post.url,
-                    data=self.presigned_post.fields,
-                    files=dict(file=("bulk_data", buffer)),
-                )
-            ).raise_for_status()
+            response = await self.__client.post(
+                self.presigned_post.url,
+                data=self.presigned_post.fields,
+                files=dict(file=("bulk_data", buffer)),
+            )
+            response.raise_for_status()
+            await response.aclose()
         return self.presigned_get
 
 

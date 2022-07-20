@@ -97,7 +97,9 @@ class _AuditRecordQueue(_Queue):
                             "Content-Type": "application/json",
                         }
                     try:
-                        client.post(**post_args).raise_for_status()
+                        response = client.post(**post_args)
+                        response.raise_for_status()
+                        response.close()
                     except Exception:
                         getLogger().exception("Error creating audit records")
                     finally:
@@ -125,11 +127,13 @@ class _BulkDataStorage(BaseBulkDataStorage):
             with GzipFile(mode="wb", fileobj=buffer) as gzf:
                 gzf.write(data)
             buffer.seek(0)
-            self.__client.post(
+            response = self.__client.post(
                 self.presigned_post.url,
                 data=self.presigned_post.fields,
                 files=dict(file=("bulk_data", buffer)),
-            ).raise_for_status()
+            )
+            response.raise_for_status()
+            response.close()
         return self.presigned_get
 
 
