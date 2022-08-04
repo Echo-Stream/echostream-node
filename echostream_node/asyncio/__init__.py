@@ -275,7 +275,7 @@ class _AppSyncCognitoAuthentication(AppSyncAuthentication):
         return dict(Authorization=self._cognito.access_token)
 
 
-class _CognitoAIOHTTPTransport(AIOHTTPTransport):
+class CognitoAIOHTTPTransport(AIOHTTPTransport):
     def __init__(self, cognito: Cognito, url: str, **kwargs: Any) -> None:
         super().__init__(auth=_AppSyncCognitoAuthentication(cognito), url=url, **kwargs)
 
@@ -316,7 +316,7 @@ class Node(BaseNode):
         self.__bulk_data_storage_queue: _BulkDataStorageQueue = None
         self.__gql_client = GqlClient(
             fetch_schema_from_transport=True,
-            transport=_CognitoAIOHTTPTransport(
+            transport=CognitoAIOHTTPTransport(
                 self.__cognito,
                 appsync_endpoint or environ["APPSYNC_ENDPOINT"],
             ),
