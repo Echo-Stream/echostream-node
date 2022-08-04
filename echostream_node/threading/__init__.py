@@ -313,7 +313,7 @@ class Node(BaseNode):
         if attributes := (
             message_type.auditor(message=message.body) | extra_attributes
         ):
-            record["attributes"] = json.dumps(attributes, separators=(",", ":"))
+            record["attributes"] = attributes
         try:
             self.__audit_records_queues[message_type.name].put_nowait(record)
         except KeyError:
