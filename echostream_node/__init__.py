@@ -195,6 +195,7 @@ _GET_NODE_GQL = gql(
                     auditor
                     name
                 }
+                stopped
             }
             ... on ManagedNode {
                 app {
@@ -221,6 +222,7 @@ _GET_NODE_GQL = gql(
                     auditor
                     name
                 }
+                stopped
             }
             tenant {
                 config
@@ -507,6 +509,7 @@ class Node(ABC):
         self.__timeout = timeout or 0.1
         self._receive_message_type: MessageType = None
         self._send_message_type: MessageType = None
+        self._stopped = False
 
     @property
     def _audit_records_endpoint(self) -> str:
@@ -605,6 +608,10 @@ class Node(ABC):
     @property
     def sources(self) -> frozenset[Edge]:
         return self._sources
+
+    @property
+    def stopped(self) -> bool:
+        return self._stopped or False
 
     @property
     def table(self) -> Table:
