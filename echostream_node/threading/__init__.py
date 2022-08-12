@@ -302,6 +302,8 @@ class Node(BaseNode):
         dict. If source is provided, it will be recorded in
         the audit.
         """
+        if self.stopped:
+            raise RuntimeError(f"{self.name} is stopped")
         extra_attributes = extra_attributes or dict()
         message_type = message.message_type
         record = dict(
@@ -379,6 +381,8 @@ class Node(BaseNode):
         Send the messages to the specified targets. If no targets are specified
         the messages will be sent to all targets.
         """
+        if self.stopped:
+            raise RuntimeError(f"{self.name} is stopped")
         if messages:
             for target in targets or self.targets:
                 if target_message_queue := self.__target_message_queues.get(
@@ -400,6 +404,7 @@ class Node(BaseNode):
                     _GET_NODE_GQL,
                     variable_values=dict(name=self.name, tenant=self.tenant),
                 )["GetNode"]
+        self._stopped = data.get("stopped")
         self.config = (
             json.loads(data["tenant"].get("config") or "{}")
             | json.loads((data.get("app") or dict()).get("config") or "{}")
@@ -410,17 +415,19 @@ class Node(BaseNode):
                 auditor=dynamic_function_loader.load(receive_message_type["auditor"]),
                 name=receive_message_type["name"],
             )
-            self.__audit_records_queues[
-                receive_message_type["name"]
-            ] = _AuditRecordQueue(self._receive_message_type, self)
+            if not self.stopped:
+                self.__audit_records_queues[
+                    receive_message_type["name"]
+                ] = _AuditRecordQueue(self._receive_message_type, self)
         if send_message_type := data.get("sendMessageType"):
             self._send_message_type = MessageType(
                 auditor=dynamic_function_loader.load(send_message_type["auditor"]),
                 name=send_message_type["name"],
             )
-            self.__audit_records_queues[send_message_type["name"]] = _AuditRecordQueue(
-                self._send_message_type, self
-            )
+            if not self.stopped:
+                self.__audit_records_queues[send_message_type["name"]] = _AuditRecordQueue(
+                    self._send_message_type, self
+                )
         if self.node_type == "AppChangeReceiverNode":
             if edge := data.get("receiveEdge"):
                 self._sources = {Edge(name=edge["source"]["name"], queue=edge["queue"])}
@@ -435,9 +442,10 @@ class Node(BaseNode):
             Edge(name=edge["target"]["name"], queue=edge["queue"])
             for edge in (data.get("sendEdges") or list())
         }
-        self.__target_message_queues = {
-            edge.name: _TargetMessageQueue(self, edge) for edge in self._targets
-        }
+        if not self.stopped:
+            self.__target_message_queues = {
+                edge.name: _TargetMessageQueue(self, edge) for edge in self._targets
+            }
 
     def stop(self) -> None:
         """Stops the Node's processing."""
@@ -633,9 +641,10 @@ class AppNode(Node):
         """
         super().start()
         self.__stop.clear()
-        self.__source_message_receivers = [
-            _SourceMessageReceiver(edge, self) for edge in self._sources
-        ]
+        if not self.stopped:
+            self.__source_message_receivers = [
+                _SourceMessageReceiver(edge, self) for edge in self._sources
+            ]
 
     def start_and_run_forever(self) -> None:
         """Will start this Node and run until stop is called"""
