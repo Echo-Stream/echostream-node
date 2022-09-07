@@ -9,18 +9,16 @@ from gzip import GzipFile, compress
 from io import BytesIO
 from os import environ
 from signal import SIG_IGN, SIGTERM, signal
-from typing import TYPE_CHECKING, Any, AsyncGenerator, BinaryIO, Optional, Union
+from typing import TYPE_CHECKING, Any, AsyncGenerator, BinaryIO, Union
 
 import dynamic_function_loader
 import simplejson as json
-
 from aws_error_utils import catch_aws_error
 from gql import Client as GqlClient
 from gql.transport.aiohttp import AIOHTTPTransport
-from gql.transport.appsync_auth import AppSyncAuthentication
+from gql_appsync_cognito_authentication import AppSyncCognitoAuthentication
 from httpx import AsyncClient as HttpxClient
 from httpx_auth import AWS4Auth
-from pycognito import Cognito
 
 from .. import _GET_BULK_DATA_STORAGE_GQL, _GET_NODE_GQL, BatchItemFailures
 from .. import BulkDataStorage as BaseBulkDataStorage
@@ -264,22 +262,6 @@ class _TargetMessageQueue(asyncio.Queue):
         return await super().get()
 
 
-class _AppSyncCognitoAuthentication(AppSyncAuthentication):
-    def __init__(self, cognito: Cognito) -> None:
-        self._cognito = cognito
-
-    def get_headers(
-        self, data: Optional[str] = None, headers: Optional[dict[str, Any]] = None
-    ) -> dict[str, Any]:
-        self._cognito.check_token()
-        return dict(Authorization=self._cognito.access_token)
-
-
-class CognitoAIOHTTPTransport(AIOHTTPTransport):
-    def __init__(self, cognito: Cognito, url: str, **kwargs: Any) -> None:
-        super().__init__(auth=_AppSyncCognitoAuthentication(cognito), url=url, **kwargs)
-
-
 class Node(BaseNode):
     """
     Base class for all implemented asyncio Nodes.
@@ -316,9 +298,9 @@ class Node(BaseNode):
         self.__bulk_data_storage_queue: _BulkDataStorageQueue = None
         self.__gql_client = GqlClient(
             fetch_schema_from_transport=True,
-            transport=CognitoAIOHTTPTransport(
-                self.__cognito,
-                appsync_endpoint or environ["APPSYNC_ENDPOINT"],
+            transport=AIOHTTPTransport(
+                auth=AppSyncCognitoAuthentication(self.__cognito),
+                url=appsync_endpoint or environ["APPSYNC_ENDPOINT"],
             ),
         )
         self.__lock: asyncio.Lock = None
@@ -479,9 +461,9 @@ class Node(BaseNode):
                 name=send_message_type["name"],
             )
             if not self.stopped:
-                self.__audit_records_queues[send_message_type["name"]] = _AuditRecordQueue(
-                    self.send_message_type, self
-                )
+                self.__audit_records_queues[
+                    send_message_type["name"]
+                ] = _AuditRecordQueue(self.send_message_type, self)
         if self.node_type == "AppChangeReceiverNode":
             if edge := data.get("receiveEdge"):
                 self._sources = {Edge(name=edge["source"]["name"], queue=edge["queue"])}

@@ -4,7 +4,6 @@ import logging
 from abc import ABC
 from dataclasses import dataclass
 from os import cpu_count, environ
-from threading import RLock
 from time import time
 from typing import TYPE_CHECKING, Any, Callable, Union
 from uuid import uuid4
@@ -13,8 +12,7 @@ import awsserviceendpoints
 import simplejson as json
 from boto3.session import Session
 from botocore.config import Config
-from botocore.credentials import DeferredRefreshableCredentials, Credentials
-from botocore.session import Session as BotocoreSession
+from echostream_botocore import AppSession
 from gql import Client as GqlClient
 from gql import gql
 from gql.transport.requests import RequestsHTTPTransport
@@ -91,39 +89,6 @@ _GET_APP_GQL = gql(
             tenant {
                 region
                 table
-            }
-        }
-    }
-    """
-)
-
-_GET_AWS_CREDENTIALS_GQL = gql(
-    """
-    query getAppAwsCredentials($name: String!, $tenant: String!, $duration: Int!) {
-        GetApp(name: $name, tenant: $tenant) {
-            ... on CrossAccountApp {
-                GetAwsCredentials(duration: $duration) {
-                    accessKeyId
-                    secretAccessKey
-                    sessionToken
-                    expiration
-                }
-            }
-            ... on ExternalApp {
-                GetAwsCredentials(duration: $duration) {
-                    accessKeyId
-                    secretAccessKey
-                    sessionToken
-                    expiration
-                }
-            }
-            ... on ManagedApp {
-                GetAwsCredentials(duration: $duration) {
-                    accessKeyId
-                    secretAccessKey
-                    sessionToken
-                    expiration
-                }
             }
         }
     }
@@ -233,37 +198,6 @@ _GET_NODE_GQL = gql(
 )
 
 
-class _NodeBotocoreSession(BotocoreSession):
-    def __init__(
-        self, *, node: Node, gql_client: GqlClient, duration: int = None
-    ) -> None:
-        super().__init__()
-        lock = RLock()
-
-        def refresher() -> dict[str, str]:
-            with lock:
-                with gql_client as session:
-                    credentials = session.execute(
-                        _GET_AWS_CREDENTIALS_GQL,
-                        variable_values=dict(
-                            name=node.app, tenant=node.tenant, duration=duration or 3600
-                        ),
-                    )["GetApp"]["GetAwsCredentials"]
-            return dict(
-                access_key=credentials["accessKeyId"],
-                expiry_time=credentials["expiration"],
-                secret_key=credentials["secretAccessKey"],
-                token=credentials["sessionToken"],
-            )
-
-        self.__credentials = DeferredRefreshableCredentials(
-            method="GetApp.GetAwsCredentials", refresh_using=refresher
-        )
-
-    def get_credentials(self) -> Credentials:
-        return self.__credentials
-
-
 Auditor = Callable[..., dict[str, Any]]
 """Typing for MessageType auditor functions"""
 
@@ -310,15 +244,6 @@ class BulkDataStorage:
         Returns False if presigned_post is expired.
         """
         return self.expiration < time()
-
-
-class CognitoRequestsHTTPTransport(RequestsHTTPTransport):
-    def __init__(self, cognito: Cognito, url: str, **kwargs: Any) -> None:
-        super().__init__(
-            auth=RequestsSrpAuth(cognito=cognito, http_header_prefix=""),
-            url=url,
-            **kwargs,
-        )
 
 
 @dataclass(frozen=True)
@@ -466,14 +391,13 @@ class Node(ABC):
         self.__cognito.authenticate(password=password or environ["PASSWORD"])
         name = name or environ["NODE"]
         tenant = tenant or environ["TENANT"]
-        gql_client = GqlClient(
+        with GqlClient(
             fetch_schema_from_transport=True,
-            transport=CognitoRequestsHTTPTransport(
-                self.__cognito,
-                appsync_endpoint or environ["APPSYNC_ENDPOINT"],
+            transport=RequestsHTTPTransport(
+                auth=RequestsSrpAuth(cognito=self.__cognito, http_header_prefix=""),
+                url=appsync_endpoint or environ["APPSYNC_ENDPOINT"],
             ),
-        )
-        with gql_client as session:
+        ) as session:
             data: dict[str, Union[str, dict]] = session.execute(
                 _GET_APP_GQL,
                 variable_values=dict(name=name, tenant=tenant),
@@ -486,7 +410,9 @@ class Node(ABC):
         self.__name = name
         self.__node_type = data["__typename"]
         self.__session = Session(
-            botocore_session=_NodeBotocoreSession(node=self, gql_client=gql_client),
+            botocore_session=AppSession(
+                app=self.__app, cognito=self.__cognito, tenant=tenant
+            ),
             region_name=data["tenant"]["region"],
         )
         self.__sources: frozenset[Edge] = None

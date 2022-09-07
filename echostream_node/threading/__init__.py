@@ -16,19 +16,14 @@ import dynamic_function_loader
 import simplejson as json
 from aws_error_utils import catch_aws_error
 from gql import Client as GqlClient
+from gql.transport.requests import RequestsHTTPTransport
 from httpx import Client as HttpxClient
 from httpx_auth import AWS4Auth
+from pycognito.utils import RequestsSrpAuth
 
 from .. import _GET_BULK_DATA_STORAGE_GQL, _GET_NODE_GQL, BatchItemFailures
 from .. import BulkDataStorage as BaseBulkDataStorage
-from .. import (
-    CognitoRequestsHTTPTransport,
-    Edge,
-    LambdaEvent,
-    LambdaSqsRecords,
-    Message,
-    MessageType,
-)
+from .. import Edge, LambdaEvent, LambdaSqsRecords, Message, MessageType
 from .. import Node as BaseNode
 from .. import PresignedPost, getLogger
 
@@ -272,9 +267,9 @@ class Node(BaseNode):
         self.__bulk_data_storage_queue = _BulkDataStorageQueue(self)
         self.__gql_client = GqlClient(
             fetch_schema_from_transport=True,
-            transport=CognitoRequestsHTTPTransport(
-                self.__cognito,
-                appsync_endpoint or environ["APPSYNC_ENDPOINT"],
+            transport=RequestsHTTPTransport(
+                auth=RequestsSrpAuth(cognito=self.__cognito, http_header_prefix=""),
+                url=appsync_endpoint or environ["APPSYNC_ENDPOINT"],
             ),
         )
         self.__lock = RLock()
@@ -425,9 +420,9 @@ class Node(BaseNode):
                 name=send_message_type["name"],
             )
             if not self.stopped:
-                self.__audit_records_queues[send_message_type["name"]] = _AuditRecordQueue(
-                    self._send_message_type, self
-                )
+                self.__audit_records_queues[
+                    send_message_type["name"]
+                ] = _AuditRecordQueue(self._send_message_type, self)
         if self.node_type == "AppChangeReceiverNode":
             if edge := data.get("receiveEdge"):
                 self._sources = {Edge(name=edge["source"]["name"], queue=edge["queue"])}
