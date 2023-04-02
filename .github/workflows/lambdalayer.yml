@@ -42,17 +42,20 @@ jobs:
       - start-runner
     runs-on: ${{ needs.start-runner.outputs.label }}
     steps:
-      - name: Install package into python dir
+      - uses: actions/checkout@v3
+      - name: Set env vars
+        run: |
+          echo "AWS_ACCESS_KEY_ID=${{ secrets.ARTIFACTS_PIPELINES_ACCESS_KEY  }}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.ARTIFACTS_PIPELINES_SECRET_KEY }}" >> $GITHUB_ENV
+      - name: Create layer
         run: |
           python3.9 -m build
           pip3.9 install --disable-pip-version-check -t python dist/echostream_node-*-py3-none-any.whl
           cd python
-          rm -rf urllib3* six* simplejson* s3transfer* python_dateutil* jmespath* botocore* boto3*
+          rm -rf urllib3* six* simplejson* s3transfer* python_dateutil* jmespath* botocore* boto3* __pycache__
           cd ..
           zip -r echostream-node.zip python/
           pip3.9 install --disable-pip-version-check boto3
-          echo "AWS_ACCESS_KEY_ID=${{ secrets.ARTIFACTS_PIPELINES_ACCESS_KEY  }}" >> $GITHUB_ENV
-          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.ARTIFACTS_PIPELINES_SECRET_KEY }}" >> $GITHUB_ENV
           python3.9 publish_layers.py echostream-node.zip
   stop-runner:
     name: Stop self-hosted EC2 runner
