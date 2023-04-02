@@ -53,7 +53,7 @@ jobs:
           pip3.9 install --disable-pip-version-check boto3
           echo "AWS_ACCESS_KEY_ID=${{ secrets.ARTIFACTS_PIPELINES_ACCESS_KEY  }}" >> $GITHUB_ENV
           echo "AWS_SECRET_ACCESS_KEY=${{ secrets.ARTIFACTS_PIPELINES_SECRET_KEY }}" >> $GITHUB_ENV
-          python3.9 publish_layers.py echostream-node.zip ${GITHUB_REF##*/}
+          python3.9 publish_layers.py echostream-node.zip
   stop-runner:
     name: Stop self-hosted EC2 runner
     needs:
