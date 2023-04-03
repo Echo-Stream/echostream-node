@@ -9,8 +9,24 @@ and supports the following EchoStream use cases:
 - A Managed Node Type, using either `threading` or `asyncio`
 
 ## Installation
+
+### Python
+
 ```bash
 pip install echostream-node
+```
+
+### AWS Lambda
+
+You may use the publiclally provided layer instead of directly installing `echostream-node` in your lambda package. This layer includes `echostream-node` and all of the Python dependencies *except* those built-in to the AWS Lambda environment for Python.
+
+The Layer arn is:
+```
+arn:aws:lambda:us-east-1:226390263822:layer:echostream-node-{version}:1
+```
+where `{version}` is the version of `echostream-node` that you want, with `.` replaced with `_`. For example, for `echostream-node==0.3.7` the layer arn would be:
+```
+arn:aws:lambda:us-east-1:226390263822:layer:echostream-node-0_3_7:1
 ```
 
 ## Usage
