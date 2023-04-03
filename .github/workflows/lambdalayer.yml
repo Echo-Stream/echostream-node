@@ -49,13 +49,13 @@ jobs:
           echo "AWS_SECRET_ACCESS_KEY=${{ secrets.ARTIFACTS_PIPELINES_SECRET_KEY }}" >> $GITHUB_ENV
       - name: Create layer
         run: |
+          pip3.9 install --disable-pip-version-check build boto3
           python3.9 -m build
           pip3.9 install --disable-pip-version-check -t python dist/echostream_node-*-py3-none-any.whl
           cd python
           rm -rf urllib3* six* simplejson* s3transfer* python_dateutil* jmespath* botocore* boto3* __pycache__
           cd ..
           zip -r echostream-node.zip python/
-          pip3.9 install --disable-pip-version-check boto3
           python3.9 publish_layers.py echostream-node.zip
   stop-runner:
     name: Stop self-hosted EC2 runner
