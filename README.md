@@ -33,6 +33,18 @@ arn:aws:lambda:us-east-1:226390263822:layer:echostream-node-0_3_7:1
 
 ## Usage
 
+### Configuration
+To instantiate a Node a number of variables are required. These can be provided either as environment variables or directly on Node creation:
+
+| Parameter | Environment Variable | Description |
+| --- | --- | --- |
+| `appsync_endpoint` | `APPSYNC_ENDPOINT` | The URL to the EchoStream API endpoint. |
+| `client_id` | `CLIENT_ID` | The Application Client ID for the App's Cognito Client Application. |
+| `name` | `NODE` | The Node's name. |
+| `password` | `PASSWORD` | The password for the App User for the Node's App. |
+| `tenant` | `TENANT` | The name of the Tenant that the Node is a part of. |
+| `username` | `USER_NAME` | The name of the App User for the Node's App. |
+| `user_pool_id` | `USER_POOL_ID` | The User Pool Id for the App's Cognito User Pool. |
 
 ### Threading Application Node
 ```python
@@ -131,11 +143,7 @@ that it receives.
 
 ### Making a Threading Application Node Concurrent
 If your Node inherits from the `echostream_node.threading.AppNode` class you can achieve concurrency
-using either threading or multi-processing. The former is appropriate if your processing is IO bound
-or your execution platform does not support shared memory (required for multi-processing). The latter
-is appropriate if your platform supports shared memory *and* your processing is CPU bound.
-
-#### Creating A Concurrent Application Node Using Threading
+using threading.
 
 This will create an AppNode that uses the provided `ThreadPoolExecutor` to concurrently
 process received `Message`s. Note that while you can set the maximum number of workers to
@@ -158,28 +166,6 @@ class MyExternalNode(AppNode):
         self.audit_message(message, source=source)
 ```
 
-#### Creating A Concurrent Application Node Using Multi-Processing
-
-This will create an AppNode that uses the provided `ProcessPoolExecutor` to concurrently
-process received `Message`s. Note that while you can set the maximum number of workers to
-less than 10, there is no gain to setting it to more than 10 since Nodes will only process
-up to 10 messages at a time.
-
-```python
-from concurrent.futures import ProcessPoolExecutor
-
-from echostream_node import Message
-from echostream_node.threading import AppNode
-
-class MyExternalNode(AppNode):
-
-    def __init__(self) -> None:
-        super().__init__(executor=ProcessPoolExecutor(max_workers=10))
-
-    def handle_received_message(self, *, message: Message, source: str) -> None:
-        print(f"Got a message:\n{message.body}")
-        self.audit_message(message, source=source)
-```
 ### Making a Asyncio Application Node Concurrent
 If your Node inherits from the `echostream_node.asyncio.Node` you can set the Node to
 process incoming `Message`s concurrently. There is no setting for the maximum number of tasks;
@@ -242,3 +228,5 @@ class MyExternalNode(LambdaNode):
         print(f"Got a message:\n{message.body}")
         self.audit_message(message, source=source)
 ```
+
+Full documentation may be found at https://docs.echostream-node.echo.stream.
