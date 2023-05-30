@@ -73,9 +73,10 @@ class _AuditRecordQueue(_Queue):
                         service="lambda",
                         security_token=credentials.token,
                     )
+                    url = node._audit_records_endpoint
                     post_args = dict(
                         auth=auth,
-                        url=f"{node._audit_records_endpoint}/{node.name}",
+                        url=f"{url}{'' if url.endswith('/') else '/'}{node.name}",
                     )
                     body = dict(
                         messageType=message_type.name,
@@ -175,11 +176,13 @@ class _TargetMessageQueue(_Queue):
     def __init__(self, node: Node, edge: Edge) -> None:
         super().__init__()
 
-        def batcher() -> Generator[
-            list[SendMessageBatchRequestEntryTypeDef],
-            None,
-            list[SendMessageBatchRequestEntryTypeDef],
-        ]:
+        def batcher() -> (
+            Generator[
+                list[SendMessageBatchRequestEntryTypeDef],
+                None,
+                list[SendMessageBatchRequestEntryTypeDef],
+            ]
+        ):
             batch: list[SendMessageBatchRequestEntryTypeDef] = list()
             batch_length = 0
             id = 0

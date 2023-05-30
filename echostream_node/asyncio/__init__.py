@@ -80,9 +80,10 @@ class _AuditRecordQueue(asyncio.Queue):
                         service="lambda",
                         security_token=credentials.token,
                     )
+                    url = node._audit_records_endpoint
                     post_args = dict(
                         auth=auth,
-                        url=f"{node._audit_records_endpoint}/{node.name}",
+                        url=f"{url}{'' if url.endswith('/') else '/'}{node.name}",
                     )
                     body = dict(
                         messageType=message_type.name,
