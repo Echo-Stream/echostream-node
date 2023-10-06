@@ -11,5 +11,5 @@ gql-appsync-cognito-authentication==0.0.1
 httpx==0.25.0
 httpx-auth==0.18.0
 pycognito==2023.5.0
-simplejson==3.19.1
+simplejson==3.19.2
 virtualenv
