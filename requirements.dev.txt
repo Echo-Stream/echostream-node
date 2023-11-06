@@ -8,7 +8,7 @@ dynamic-function-loader==0.0.3
 echostream-botocore==0.0.2
 gql[aiohttp,requests]==3.4.1
 gql-appsync-cognito-authentication==0.0.1
-httpx==0.25.0
+httpx==0.25.1
 httpx-auth==0.18.0
 pycognito==2023.5.0
 simplejson==3.19.1
