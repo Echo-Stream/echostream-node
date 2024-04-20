@@ -190,9 +190,9 @@ class _TargetMessageQueue(asyncio.Queue):
         async def sender() -> None:
             cancelled = asyncio.Event()
 
-            async def batcher() -> AsyncGenerator[
-                list[SendMessageBatchRequestEntryTypeDef], None
-            ]:
+            async def batcher() -> (
+                AsyncGenerator[list[SendMessageBatchRequestEntryTypeDef], None]
+            ):
                 batch: list[SendMessageBatchRequestEntryTypeDef] = list()
                 batch_length = 0
                 id = 0
@@ -447,24 +447,25 @@ class Node(BaseNode):
             | json.loads((data.get("app") or dict()).get("config") or "{}")
             | json.loads(data.get("config") or "{}")
         )
+        audit = data.get("audit")
         if receive_message_type := data.get("receiveMessageType"):
             self._receive_message_type = MessageType(
                 auditor=dynamic_function_loader.load(receive_message_type["auditor"]),
                 name=receive_message_type["name"],
             )
-            if not self.stopped:
-                self.__audit_records_queues[
-                    receive_message_type["name"]
-                ] = _AuditRecordQueue(self.receive_message_type, self)
+            if not (self.stopped and audit):
+                self.__audit_records_queues[receive_message_type["name"]] = (
+                    _AuditRecordQueue(self.receive_message_type, self)
+                )
         if send_message_type := data.get("sendMessageType"):
             self._send_message_type = MessageType(
                 auditor=dynamic_function_loader.load(send_message_type["auditor"]),
                 name=send_message_type["name"],
             )
-            if not self.stopped:
-                self.__audit_records_queues[
-                    send_message_type["name"]
-                ] = _AuditRecordQueue(self.send_message_type, self)
+            if not (self.stopped and audit):
+                self.__audit_records_queues[send_message_type["name"]] = (
+                    _AuditRecordQueue(self.send_message_type, self)
+                )
         if self.node_type == "AppChangeReceiverNode":
             if edge := data.get("receiveEdge"):
                 self._sources = {Edge(name=edge["source"]["name"], queue=edge["queue"])}
