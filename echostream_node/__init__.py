@@ -190,6 +190,7 @@ _GET_NODE_GQL = gql(
                 stopped
             }
             tenant {
+                audit
                 config
             }
         }
@@ -332,9 +333,11 @@ class Message:
         length = len(self.body)
         for name, attribute in self.message_attributes.items():
             value = attribute[
-                "StringValue"
-                if (data_type := attribute["DataType"]) in ("String", "Number")
-                else "BinaryValue"
+                (
+                    "StringValue"
+                    if (data_type := attribute["DataType"]) in ("String", "Number")
+                    else "BinaryValue"
+                )
             ]
             length += len(name) + len(data_type) + len(value)
         if length > 262144:
