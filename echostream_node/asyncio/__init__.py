@@ -453,7 +453,7 @@ class Node(BaseNode):
                 auditor=dynamic_function_loader.load(receive_message_type["auditor"]),
                 name=receive_message_type["name"],
             )
-            if not (self.stopped and audit):
+            if not self.stopped and audit:
                 self.__audit_records_queues[receive_message_type["name"]] = (
                     _AuditRecordQueue(self.receive_message_type, self)
                 )
@@ -462,7 +462,7 @@ class Node(BaseNode):
                 auditor=dynamic_function_loader.load(send_message_type["auditor"]),
                 name=send_message_type["name"],
             )
-            if not (self.stopped and audit):
+            if not self.stopped and audit:
                 self.__audit_records_queues[send_message_type["name"]] = (
                     _AuditRecordQueue(self.send_message_type, self)
                 )
