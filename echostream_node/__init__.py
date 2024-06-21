@@ -436,6 +436,7 @@ class Node(ABC):
         self.__targets: frozenset[Edge] = None
         self.__tenant = tenant
         self.__timeout = timeout or 0.1
+        self._audit = False
         self._receive_message_type: MessageType = None
         self._send_message_type: MessageType = None
         self._stopped = False
@@ -479,6 +480,10 @@ class Node(ABC):
     @property
     def app_type(self) -> str:
         return self.__app_type
+
+    @property
+    def audit(self) -> bool:
+        return self._audit
 
     @property
     def bulk_data_acceleration(self) -> bool:
