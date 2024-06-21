@@ -331,6 +331,8 @@ class Node(BaseNode):
         """
         if self.stopped:
             raise RuntimeError(f"{self.name} is stopped")
+        if not self.audit:
+            return
         extra_attributes = extra_attributes or dict()
         message_type = message.message_type
         record = dict(
@@ -441,19 +443,19 @@ class Node(BaseNode):
                         variable_values=dict(name=self.name, tenant=self.tenant),
                     )
                 )["GetNode"]
-        self._stopped = data.get("stopped")
+        self._audit = data["tenant"].get("audit") or False
         self.config = (
             json.loads(data["tenant"].get("config") or "{}")
             | json.loads((data.get("app") or dict()).get("config") or "{}")
             | json.loads(data.get("config") or "{}")
         )
-        audit = data.get("audit")
+        self._stopped = data.get("stopped")
         if receive_message_type := data.get("receiveMessageType"):
             self._receive_message_type = MessageType(
                 auditor=dynamic_function_loader.load(receive_message_type["auditor"]),
                 name=receive_message_type["name"],
             )
-            if not self.stopped and audit:
+            if not self.stopped and self.audit:
                 self.__audit_records_queues[receive_message_type["name"]] = (
                     _AuditRecordQueue(self.receive_message_type, self)
                 )
@@ -462,7 +464,7 @@ class Node(BaseNode):
                 auditor=dynamic_function_loader.load(send_message_type["auditor"]),
                 name=send_message_type["name"],
             )
-            if not self.stopped and audit:
+            if not self.stopped and self.audit:
                 self.__audit_records_queues[send_message_type["name"]] = (
                     _AuditRecordQueue(self.send_message_type, self)
                 )
