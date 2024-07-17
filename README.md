@@ -8,6 +8,8 @@ and supports the following EchoStream use cases:
 - An External Node in a Cross Account App that is an AWS Lambda function. This use case only supports `threading`.
 - A Managed Node Type, using either `threading` or `asyncio`
 
+> NOTE: Version >=0.4.0 requires Python 3.12 support
+
 ## Installation
 
 ### Python
@@ -26,9 +28,9 @@ arn:aws:lambda:{region}:226390263822:layer:echostream-node-{version}:1
 ```
 where `{version}` is the version of `echostream-node` that you want, with `.` replaced with `_` and `{region}` is the AWS region that your Lambda will run in. Currently, `us-east-1`, `us-east-2`, `us-west-1` and `us-west-2` are supported.
 
-For example, for `echostream-node==0.3.7` in the `us-east-1` region the layer arn would be:
+For example, for `echostream-node==0.4.0` in the `us-east-1` region the layer arn would be:
 ```
-arn:aws:lambda:us-east-1:226390263822:layer:echostream-node-0_3_7:1
+arn:aws:lambda:us-east-1:226390263822:layer:echostream-node-0_4_0:1
 ```
 
 ## Usage

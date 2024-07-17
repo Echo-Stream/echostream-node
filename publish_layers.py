@@ -17,7 +17,7 @@ for region_name in ("us-east-1", "us-east-2", "us-west-1", "us-west-2"):
     lambda_client = boto3.client("lambda", region_name=region_name)
     response = lambda_client.publish_layer_version(
         CompatibleArchitectures=["x86_64"],
-        CompatibleRuntimes=["python3.9"],
+        CompatibleRuntimes=["python3.12"],
         Content=dict(ZipFile=echostream_node_zip),
         Description=f"echostream-node=={version} with all dependencies not present in the AWS Lambda environment",
         LayerName=layer_name,
