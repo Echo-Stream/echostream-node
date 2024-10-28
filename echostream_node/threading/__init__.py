@@ -76,7 +76,8 @@ class _AuditRecordQueue(_Queue):
                     url = node._audit_records_endpoint
                     post_args = dict(
                         auth=auth,
-                        url=f"{url}{'' if url.endswith('/') else '/'}{node.name}",
+                        url=f"{url}{'' if url.endswith(
+                            '/') else '/'}{node.name}",
                     )
                     body = dict(
                         messageType=message_type.name,
@@ -156,10 +157,12 @@ class _BulkDataStorageQueue(Queue):
                         getLogger().exception("Error getting bulk data storage")
                     else:
                         for bulk_data_storage in bulk_data_storages:
-                            self.put_nowait(_BulkDataStorage(bulk_data_storage, client))
+                            self.put_nowait(_BulkDataStorage(
+                                bulk_data_storage, client))
                     self.__fill.clear()
 
-        Thread(daemon=True, name="BulkDataStorageQueueFiller", target=filler).start()
+        Thread(daemon=True, name="BulkDataStorageQueueFiller",
+               target=filler).start()
 
     def get(self, block: bool = True, timeout: float = None) -> _BulkDataStorage:
         if self.qsize() < 20:
@@ -220,10 +223,12 @@ class _TargetMessageQueue(_Queue):
                     for failed in response.get("Failed", list()):
                         id = failed.pop("Id")
                         getLogger().error(
-                            f"Unable to send message {entries[id]} to {edge.name}, reason {failed}"
+                            f"Unable to send message {entries[id]} to {
+                                edge.name}, reason {failed}"
                         )
                 except Exception:
-                    getLogger().exception(f"Error sending messages to {edge.name}")
+                    getLogger().exception(
+                        f"Error sending messages to {edge.name}")
                 finally:
                     self.tasks_done(len(entries))
 
@@ -269,7 +274,8 @@ class Node(BaseNode):
         self.__gql_client = GqlClient(
             fetch_schema_from_transport=True,
             transport=RequestsHTTPTransport(
-                auth=RequestsSrpAuth(cognito=self.__cognito, http_header_prefix=""),
+                auth=RequestsSrpAuth(cognito=self.__cognito,
+                                     http_header_prefix=""),
                 url=appsync_endpoint or environ["APPSYNC_ENDPOINT"],
             ),
         )
@@ -338,7 +344,8 @@ class Node(BaseNode):
                 "messages and extra_attributes must have the same number of items"
             )
         for message, attributes in zip(messages, extra_attributes):
-            self.audit_message(message, extra_attributes=attributes, source=source)
+            self.audit_message(
+                message, extra_attributes=attributes, source=source)
 
     def handle_bulk_data(self, data: Union[bytearray, bytes]) -> str:
         """
@@ -411,7 +418,8 @@ class Node(BaseNode):
         self._stopped = data.get("stopped")
         if receive_message_type := data.get("receiveMessageType"):
             self._receive_message_type = MessageType(
-                auditor=dynamic_function_loader.load(receive_message_type["auditor"]),
+                auditor=dynamic_function_loader.load(
+                    receive_message_type["auditor"]),
                 name=receive_message_type["name"],
             )
             if not self.stopped and self.audit:
@@ -420,16 +428,18 @@ class Node(BaseNode):
                 )
         if send_message_type := data.get("sendMessageType"):
             self._send_message_type = MessageType(
-                auditor=dynamic_function_loader.load(send_message_type["auditor"]),
+                auditor=dynamic_function_loader.load(
+                    send_message_type["auditor"]),
                 name=send_message_type["name"],
             )
-            if not self.stopped and self.auditaudit:
+            if not self.stopped and self.audit:
                 self.__audit_records_queues[send_message_type["name"]] = (
                     _AuditRecordQueue(self._send_message_type, self)
                 )
         if self.node_type == "AppChangeReceiverNode":
             if edge := data.get("receiveEdge"):
-                self._sources = {Edge(name=edge["source"]["name"], queue=edge["queue"])}
+                self._sources = {
+                    Edge(name=edge["source"]["name"], queue=edge["queue"])}
             else:
                 self._sources = set()
         else:
@@ -478,10 +488,12 @@ class _DeleteMessageQueue(_Queue):
                     for failed in response.get("Failed", list()):
                         id = failed.pop("Id")
                         getLogger().error(
-                            f"Unable to delete message {receipt_handles[id]} from {edge.name}, reason {failed}"
+                            f"Unable to delete message {receipt_handles[id]} from {
+                                edge.name}, reason {failed}"
                         )
                 except Exception:
-                    getLogger().exception(f"Error deleting messages from {edge.name}")
+                    getLogger().exception(
+                        f"Error deleting messages from {edge.name}")
                 finally:
                     self.tasks_done(len(receipt_handles))
 
@@ -524,7 +536,8 @@ class _SourceMessageReceiver(Thread):
                         WaitTimeSeconds=20,
                     )
                 except catch_aws_error("AWS.SimpleQueueService.NonExistentQueue"):
-                    getLogger().warning(f"Queue {edge.queue} does not exist, exiting")
+                    getLogger().warning(
+                        f"Queue {edge.queue} does not exist, exiting")
                     break
                 except Exception:
                     getLogger().exception(
@@ -534,7 +547,8 @@ class _SourceMessageReceiver(Thread):
                 else:
                     if not (sqs_messages := response.get("Messages")):
                         continue
-                    getLogger().info(f"Received {len(sqs_messages)} from {edge.name}")
+                    getLogger().info(
+                        f"Received {len(sqs_messages)} from {edge.name}")
 
                     message_handlers = [
                         partial(
@@ -575,7 +589,8 @@ class _SourceMessageReceiver(Thread):
 
             getLogger().info(f"Stopping receiving messages from {edge.name}")
 
-        super().__init__(name=f"SourceMessageReceiver({edge.name})", target=receive)
+        super().__init__(
+            name=f"SourceMessageReceiver({edge.name})", target=receive)
         self.start()
 
     def join(self) -> None:
@@ -737,7 +752,8 @@ class LambdaNode(Node):
             except Exception:
                 if not self.__report_batch_item_failures:
                     raise
-                getLogger().exception(f"Error handling recevied message for {source}")
+                getLogger().exception(
+                    f"Error handling recevied message for {source}")
             else:
                 if self.__report_batch_item_failures:
                     batch_item_failures.remove(message_id)
