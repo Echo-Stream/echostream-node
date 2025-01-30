@@ -339,10 +339,13 @@ class Node(BaseNode):
         dict and they must have the same count as messages.
         If source is provided, it will be recorded in the audit.
         """
-        if extra_attributes and len(extra_attributes) != len(messages):
-            raise ValueError(
-                "messages and extra_attributes must have the same number of items"
-            )
+        if extra_attributes:
+            if len(extra_attributes) != len(messages):
+                raise ValueError(
+                    "messages and extra_attributes must have the same number of items"
+                )
+        else:
+            extra_attributes = [dict()] * len(messages)
         for message, attributes in zip(messages, extra_attributes):
             self.audit_message(
                 message, extra_attributes=attributes, source=source)
